@@ -659,6 +659,88 @@ function resolveLockerDocTitle(doc, lockId) {
   return doc?.is_liquidity ? "Liquidity Lock" : `Lock ${lockId}`;
 }
 
+function makeLockCandidateKey(candidate) {
+  const chainId = String(candidate?.chainId || "");
+  const lockId = String(candidate?.lockId || "").trim().toLowerCase();
+  const lockerPubkey = String(candidate?.lockerPubkey || "").trim().toLowerCase();
+  const base = lockerPubkey || lockId;
+  return base ? `${chainId}:${base}` : "";
+}
+
+function mergeLockCandidate(baseCandidate, nextCandidate) {
+  return {
+    ...baseCandidate,
+    ...nextCandidate,
+    doc: nextCandidate?.doc || baseCandidate?.doc || null,
+    title: firstNonEmptyString(nextCandidate?.title, baseCandidate?.title),
+    sourceTypes: [
+      ...new Set([...(baseCandidate?.sourceTypes || []), ...(nextCandidate?.sourceTypes || [])])
+    ]
+  };
+}
+
+function upsertLockCandidate(map, candidate) {
+  const key = makeLockCandidateKey(candidate);
+  if (!key) return;
+  const existing = map.get(key);
+  map.set(key, existing ? mergeLockCandidate(existing, candidate) : candidate);
+}
+
+function buildLockCandidates({ pageProps, chainId, lockerDocs }) {
+  const candidates = new Map();
+  const resolvedChainId = Number(chainId);
+  const pool = pageProps?.pool?.pool || {};
+  const risk = pageProps?.pool?.riskDetails || {};
+
+  const poolLocker = firstNonEmptyString(pool?.locker);
+  if (resolvedChainId === 501424 && poolLocker) {
+    upsertLockCandidate(candidates, {
+      chainId: resolvedChainId,
+      lockId: poolLocker,
+      lockerPubkey: poolLocker,
+      isLiquidity: Boolean(
+        toPositiveSafeNumber(pool?.liquidityLockDuration) > 0 ||
+          toPositiveSafeNumber(risk?.lpLockDays) > 0
+      ),
+      title: "",
+      doc: null,
+      sourceTypes: ["pool-info"]
+    });
+  }
+
+  for (const doc of lockerDocs || []) {
+    const lockId = String(doc?.lock_id || "").trim();
+    const lockerPubkey = firstNonEmptyString(doc?.solana_details?.locker_pubkey);
+    if (!lockId && !lockerPubkey) continue;
+
+    upsertLockCandidate(candidates, {
+      chainId: Number(doc?.chain_id || resolvedChainId),
+      lockId: lockId || lockerPubkey,
+      lockerPubkey,
+      isLiquidity: Boolean(doc?.is_liquidity),
+      title: resolveLockerDocTitle(doc, lockId || lockerPubkey),
+      doc,
+      sourceTypes: ["lockers-api"]
+    });
+  }
+
+  return [...candidates.values()];
+}
+
+function hasResolvedLockRecord(record) {
+  if (!record) return false;
+  return (
+    toBigIntSafe(record.amount) > 0n ||
+    toBigIntSafe(record.unlockedAmount) > 0n ||
+    toBigIntSafe(record.currentLockedAmount) > 0n ||
+    toPositiveSafeNumber(record.lockDate) > 0 ||
+    toPositiveSafeNumber(record.expiredAt) > 0 ||
+    toPositiveSafeNumber(record.tgePercentBps) > 0 ||
+    toPositiveSafeNumber(record.cycleReleasePercentBps) > 0 ||
+    toPositiveSafeNumber(record.cycleValue) > 0
+  );
+}
+
 function getRecordCycleValue(rec) {
   return toPositiveSafeNumber(rec?.cycleValue ?? rec?.cycleDays ?? 0);
 }
@@ -1200,133 +1282,139 @@ export default async function handler(req, res) {
     const lockerDocs = Array.isArray(lockersBootstrap?.value?.docs)
       ? lockersBootstrap.value.docs
       : [];
-    const lockableDocs = lockerDocs
-      .map((doc) => {
-        const lockId = String(doc?.lock_id || "");
-        const apiAmount = toBigIntSafe(doc?.amount);
-        const apiUnlocked = toBigIntSafe(doc?.unlocked_amount);
-        const apiCurrentLockedAmount = apiAmount > apiUnlocked ? apiAmount - apiUnlocked : 0n;
-        return { doc, lockId, apiAmount, apiUnlocked, apiCurrentLockedAmount };
-      })
-      .filter((entry) => entry.lockId);
+    const lockCandidates = buildLockCandidates({
+      pageProps,
+      chainId,
+      lockerDocs
+    });
 
-    const lockRecords = await Promise.all(
-      lockableDocs.map(async ({ doc, lockId, apiAmount, apiUnlocked, apiCurrentLockedAmount }) => {
-        const resolvedChainId = Number(doc?.chain_id || chainId);
-        const tokenDecimals =
-          toPositiveSafeNumber(doc?.token_decimals) ||
-          toPositiveSafeNumber(pageProps?.pool?.token?.decimals) ||
-          18;
-        let title = resolveLockerDocTitle(doc, lockId);
-        let cycleValue = parseCycleDays(title);
-        let cycleUnit = "days";
-        let cycleSeconds = 0;
-        let lockDate = toPositiveSafeNumber(doc?.lock_date);
-        let expiredAt = toPositiveSafeNumber(doc?.expired);
-        let tgePercentBps = 0;
-        let cycleReleasePercentBps = 0;
-        let amount = apiAmount;
-        let unlocked = apiUnlocked;
-        let currentLockedAmount = apiCurrentLockedAmount;
+    const lockRecords = (
+      await Promise.all(
+        lockCandidates.map(async (candidate) => {
+          const doc = candidate?.doc || null;
+          const lockId = String(candidate?.lockId || "").trim();
+          const lockerPubkey = firstNonEmptyString(candidate?.lockerPubkey);
+          const apiAmount = toBigIntSafe(doc?.amount);
+          const apiUnlocked = toBigIntSafe(doc?.unlocked_amount);
+          const apiCurrentLockedAmount = apiAmount > apiUnlocked ? apiAmount - apiUnlocked : 0n;
+          const resolvedChainId = Number(candidate?.chainId || doc?.chain_id || chainId);
+          const tokenDecimals =
+            toPositiveSafeNumber(doc?.token_decimals) ||
+            toPositiveSafeNumber(pageProps?.pool?.token?.decimals) ||
+            18;
+          let title = firstNonEmptyString(candidate?.title) || resolveLockerDocTitle(doc, lockId);
+          let cycleValue = parseCycleDays(title);
+          let cycleUnit = "days";
+          let cycleSeconds = 0;
+          let lockDate = toPositiveSafeNumber(doc?.lock_date);
+          let expiredAt = toPositiveSafeNumber(doc?.expired);
+          let tgePercentBps = 0;
+          let cycleReleasePercentBps = 0;
+          let amount = apiAmount;
+          let unlocked = apiUnlocked;
+          let currentLockedAmount = apiCurrentLockedAmount;
 
-        if (isSupportedEvmChain(resolvedChainId)) {
-          const record = await fetchPinklockRecordOnChain({
-            chainId: resolvedChainId,
-            lockId,
-            lockVersion: doc?.lock_version
-          });
-          if (record) {
-            title = record.title || title;
-            amount = toBigIntSafe(record.amount) || amount;
-            unlocked = toBigIntSafe(record.unlockedAmount);
-            currentLockedAmount = amount > unlocked ? amount - unlocked : 0n;
-            cycleSeconds = record.cycle || 0;
-            cycleUnit = getPinklockCycleUnit(resolvedChainId);
-            cycleValue = normalizePinklockCycleValue(cycleSeconds, resolvedChainId);
-            lockDate = record.lockDate || lockDate;
-            expiredAt = record.tgeDate || expiredAt;
-            tgePercentBps = record.tgePercentBps || 0;
-            cycleReleasePercentBps = record.cycleReleasePercentBps || 0;
-          }
-        } else if (resolvedChainId === 501424) {
-          const record = await fetchSolanaPinklockRecord(doc?.solana_details?.locker_pubkey);
-          if (record) {
-            title = record.title || title;
-            amount = toBigIntSafe(record.amount) || amount;
-            unlocked = toBigIntSafe(record.unlockedAmount);
-            currentLockedAmount = amount > unlocked ? amount - unlocked : 0n;
-            cycleSeconds = record.cycleSeconds || 0;
-            cycleUnit = "days";
-            cycleValue = normalizePinklockCycleValue(cycleSeconds, resolvedChainId);
-            lockDate = record.lockDate || lockDate;
-            expiredAt = record.unlockDate || expiredAt;
-            tgePercentBps = record.tgePercentBps || 0;
-            cycleReleasePercentBps = record.cycleReleasePercentBps || 0;
-          }
-        }
-
-        if (
-          isSupportedEvmChain(resolvedChainId) &&
-          (isGenericLockTitle(title, lockId, Boolean(doc?.is_liquidity)) ||
-            (!cycleValue && !tgePercentBps && !cycleReleasePercentBps))
-        ) {
-          const pageRecord = await fetchPinklockRecordFromPage({
-            chainId: resolvedChainId,
-            lockId,
-            tokenDecimals
-          });
-          if (pageRecord) {
-            title = pageRecord.title || title;
-            if (pageRecord.amount) {
-              amount = toBigIntSafe(pageRecord.amount) || amount;
+          if (isSupportedEvmChain(resolvedChainId) && lockId) {
+            const record = await fetchPinklockRecordOnChain({
+              chainId: resolvedChainId,
+              lockId,
+              lockVersion: doc?.lock_version
+            });
+            if (record) {
+              title = record.title || title;
+              amount = toBigIntSafe(record.amount) || amount;
+              unlocked = toBigIntSafe(record.unlockedAmount);
+              currentLockedAmount = amount > unlocked ? amount - unlocked : 0n;
+              cycleSeconds = record.cycle || 0;
+              cycleUnit = getPinklockCycleUnit(resolvedChainId);
+              cycleValue = normalizePinklockCycleValue(cycleSeconds, resolvedChainId);
+              lockDate = record.lockDate || lockDate;
+              expiredAt = record.tgeDate || expiredAt;
+              tgePercentBps = record.tgePercentBps || 0;
+              cycleReleasePercentBps = record.cycleReleasePercentBps || 0;
             }
-            if (pageRecord.unlockedAmount) {
-              unlocked = toBigIntSafe(pageRecord.unlockedAmount);
+          } else if (resolvedChainId === 501424 && lockerPubkey) {
+            const record = await fetchSolanaPinklockRecord(lockerPubkey);
+            if (record) {
+              title = record.title || title;
+              amount = toBigIntSafe(record.amount) || amount;
+              unlocked = toBigIntSafe(record.unlockedAmount);
+              currentLockedAmount = amount > unlocked ? amount - unlocked : 0n;
+              cycleSeconds = record.cycleSeconds || 0;
+              cycleUnit = "days";
+              cycleValue = normalizePinklockCycleValue(cycleSeconds, resolvedChainId);
+              lockDate = record.lockDate || lockDate;
+              expiredAt = record.unlockDate || expiredAt;
+              tgePercentBps = record.tgePercentBps || 0;
+              cycleReleasePercentBps = record.cycleReleasePercentBps || 0;
             }
-            currentLockedAmount = amount > unlocked ? amount - unlocked : 0n;
-            cycleSeconds = pageRecord.cycleSeconds || cycleSeconds;
-            cycleUnit = pageRecord.cycleUnit || cycleUnit;
-            cycleValue = pageRecord.cycleValue || cycleValue;
-            lockDate = pageRecord.lockDate || lockDate;
-            expiredAt = pageRecord.tgeDate || expiredAt;
-            tgePercentBps = pageRecord.tgePercentBps || tgePercentBps;
-            cycleReleasePercentBps =
-              pageRecord.cycleReleasePercentBps || cycleReleasePercentBps;
           }
-        }
 
-        if (isGenericLockTitle(title, lockId, Boolean(doc?.is_liquidity))) {
-          title = getFallbackLockTitle({
+          if (
+            isSupportedEvmChain(resolvedChainId) &&
+            lockId &&
+            (isGenericLockTitle(title, lockId, Boolean(candidate?.isLiquidity)) ||
+              (!cycleValue && !tgePercentBps && !cycleReleasePercentBps))
+          ) {
+            const pageRecord = await fetchPinklockRecordFromPage({
+              chainId: resolvedChainId,
+              lockId,
+              tokenDecimals
+            });
+            if (pageRecord) {
+              title = pageRecord.title || title;
+              if (pageRecord.amount) {
+                amount = toBigIntSafe(pageRecord.amount) || amount;
+              }
+              if (pageRecord.unlockedAmount) {
+                unlocked = toBigIntSafe(pageRecord.unlockedAmount);
+              }
+              currentLockedAmount = amount > unlocked ? amount - unlocked : 0n;
+              cycleSeconds = pageRecord.cycleSeconds || cycleSeconds;
+              cycleUnit = pageRecord.cycleUnit || cycleUnit;
+              cycleValue = pageRecord.cycleValue || cycleValue;
+              lockDate = pageRecord.lockDate || lockDate;
+              expiredAt = pageRecord.tgeDate || expiredAt;
+              tgePercentBps = pageRecord.tgePercentBps || tgePercentBps;
+              cycleReleasePercentBps =
+                pageRecord.cycleReleasePercentBps || cycleReleasePercentBps;
+            }
+          }
+
+          if (isGenericLockTitle(title, lockId, Boolean(candidate?.isLiquidity))) {
+            title = getFallbackLockTitle({
+              lockId,
+              isLiquidity: Boolean(candidate?.isLiquidity),
+              title
+            });
+          }
+
+          const cycleText = formatPinklockCycleText(cycleValue, cycleUnit);
+          const record = {
             lockId,
-            isLiquidity: Boolean(doc?.is_liquidity),
-            title
-          });
-        }
+            title,
+            cycleValue,
+            cycleSeconds,
+            cycleUnit,
+            cycleText,
+            cycleDays: cycleUnit === "days" ? cycleValue : 0,
+            lockDate,
+            expiredAt,
+            isLiquidity: Boolean(candidate?.isLiquidity),
+            isUnlocked: currentLockedAmount <= 0n,
+            tgePercentBps,
+            tgePercent: percentFromBps(tgePercentBps),
+            cycleReleasePercentBps,
+            cycleReleasePercent: percentFromBps(cycleReleasePercentBps),
+            amount: amount.toString(),
+            unlockedAmount: unlocked.toString(),
+            currentLockedAmount: currentLockedAmount.toString()
+          };
 
-        const cycleText = formatPinklockCycleText(cycleValue, cycleUnit);
-
-        return {
-          lockId,
-          title,
-          cycleValue,
-          cycleSeconds,
-          cycleUnit,
-          cycleText,
-          cycleDays: cycleUnit === "days" ? cycleValue : 0,
-          lockDate,
-          expiredAt,
-          isLiquidity: Boolean(doc?.is_liquidity),
-          isUnlocked: currentLockedAmount <= 0n,
-          tgePercentBps,
-          tgePercent: percentFromBps(tgePercentBps),
-          cycleReleasePercentBps,
-          cycleReleasePercent: percentFromBps(cycleReleasePercentBps),
-          amount: amount.toString(),
-          unlockedAmount: unlocked.toString(),
-          currentLockedAmount: currentLockedAmount.toString()
-        };
-      })
-    );
+          return hasResolvedLockRecord(record) ? record : null;
+        })
+      )
+    ).filter(Boolean);
 
     const mapped = mapTokenomicsWithLockRecords(pageProps, lockRecords);
 
