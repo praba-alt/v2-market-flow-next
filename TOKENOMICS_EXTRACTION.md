@@ -63,6 +63,176 @@ https://r.jina.ai/http://api.pinksale.finance/...
 - If PinkSale text conflicts with a successful contract/account decode, prefer the contract/account decode.
 - Do not emit a lock record row unless it resolved to meaningful lock data.
 
+## RPC URL sources
+
+### EVM RPC resolution
+EVM RPC URLs are resolved from shared chain config.
+
+Priority:
+1. chain-specific env var
+2. shared default public RPC URL in `lib/pinksale-chains.js`
+
+Current EVM chain map:
+
+| Chain ID | Chain | Env Var | Default RPC |
+| --- | --- | --- | --- |
+| `1` | Ethereum | `ETHEREUM_RPC_URL` | `https://ethereum.publicnode.com` |
+| `25` | Cronos | `CRONOS_RPC_URL` | `https://evm.cronos.org` |
+| `56` | BNB Chain | `BSC_RPC_URL` | `https://bsc-dataseed.binance.org/` |
+| `97` | BNB Chain Testnet | `BSC_TESTNET_RPC_URL` | `https://data-seed-prebsc-1-s1.binance.org:8545/` |
+| `109` | Shibarium | `SHIBARIUM_RPC_URL` | `https://rpc.shibrpc.com` |
+| `130` | Unichain | `UNICHAIN_RPC_URL` | `https://mainnet.unichain.org` |
+| `137` | Polygon | `POLYGON_RPC_URL` | `https://polygon-bor.publicnode.com` |
+| `196` | X Layer | `XLAYER_RPC_URL` | `https://rpc.xlayer.tech` |
+| `250` | Fantom | `FANTOM_RPC_URL` | `https://rpc.ftm.tools` |
+| `369` | PulseChain | `PULSECHAIN_RPC_URL` | `https://rpc.pulsechain.com` |
+| `1116` | Core | `CORE_RPC_URL` | `https://rpc.coredao.org` |
+| `2000` | Dogechain | `DOGECHAIN_RPC_URL` | `https://rpc.dogechain.dog` |
+| `3797` | Alvey | `ALVEY_RPC_URL` | `https://rpc.alvey.io` |
+| `7000` | ZetaChain | `ZETACHAIN_RPC_URL` | `https://zetachain-evm.blockpi.network/v1/rpc/public` |
+| `7171` | Bitrock | `BITROCK_RPC_URL` | `https://connect.bit-rock.io` |
+| `8453` | Base | `BASE_RPC_URL` | `https://base.publicnode.com` |
+| `42161` | Arbitrum | `ARBITRUM_RPC_URL` | `https://arbitrum-one.publicnode.com` |
+| `43114` | Avalanche | `AVALANCHE_RPC_URL` | `https://api.avax.network/ext/bc/C/rpc` |
+
+### Non-EVM RPC resolution
+Current first-class non-EVM RPC support is Solana only.
+
+Priority:
+1. `SOLANA_RPC_URL`
+2. `NEXT_ALCHEMY_KEY` mapped to `https://solana-mainnet.g.alchemy.com/v2/<KEY>`
+3. `NEXT_PUBLIC_SOLANA_RPC`
+4. `https://api.mainnet-beta.solana.com`
+
+Allowed Solana RPC methods:
+- `getTokenAccountsByOwner`
+- `getTokenAccountBalance`
+- `getTokenSupply`
+- `getBalance`
+- `getAccountInfo`
+
+## Contract / RPC call reference
+
+### EVM JSON-RPC transport
+All EVM contract calls are standard `eth_call` requests:
+
+```js
+{
+  jsonrpc: "2.0",
+  id: 1,
+  method: "eth_call",
+  params: [
+    { to: CONTRACT_ADDRESS, data: CALL_DATA },
+    "latest"
+  ]
+}
+```
+
+### EVM token metadata calls
+Used to enrich token snapshot after PinkSale bootstrap.
+
+Selectors:
+- `decimals()` -> `0x313ce567`
+- `totalSupply()` -> `0x18160ddd`
+
+Example:
+```js
+eth_call({
+  to: tokenAddress,
+  data: "0x313ce567" // decimals()
+}, "latest")
+
+eth_call({
+  to: tokenAddress,
+  data: "0x18160ddd" // totalSupply()
+}, "latest")
+```
+
+### EVM PinkLock calls
+Used to resolve lock detail truth on supported EVM chains.
+
+Selector:
+- `getLockById(uint256)` -> `0x08f12470`
+
+Call-data construction:
+```js
+const data = "0x08f12470" + lockIdHexPaddedTo32Bytes;
+```
+
+Request:
+```js
+eth_call({
+  to: pinkLockAddress,
+  data
+}, "latest")
+```
+
+Decoded fields used by the API:
+- `amount`
+- `lockDate`
+- `tgeDate`
+- `tgeBps`
+- `cycle`
+- `cycleBps`
+- `unlockedAmount`
+- `description`
+
+Title resolution:
+- decode `description` JSON
+- prefer `title`
+- support PinkSale short key `l`
+- otherwise fall back to:
+  - `Manual Liquidity Lock`
+  - `Lock <id>`
+
+### Solana RPC calls
+
+#### Token supply
+Used for mint `decimals` and `totalSupply`.
+
+```js
+{
+  jsonrpc: "2.0",
+  id: 1,
+  method: "getTokenSupply",
+  params: [mintAddress]
+}
+```
+
+#### Locker account decode
+Used to resolve Solana lock records from `pool.locker` or locker API pubkeys.
+
+```js
+{
+  jsonrpc: "2.0",
+  id: 1,
+  method: "getAccountInfo",
+  params: [lockerPubkey, { encoding: "base64" }]
+}
+```
+
+Decoded fields used by the API:
+- `lockDate`
+- `unlockDate`
+- `cycleSeconds`
+- `tgePercentBps`
+- `cycleReleasePercentBps`
+- `amount`
+- `unlockedAmount`
+- `title`
+
+## PinkLock contract mapping
+PinkLock addresses are mapped per EVM chain inside the API.
+
+The handler chooses a contract address by:
+1. chain id
+2. explicit `lock_version` when available
+3. fallback heuristic for high lock ids that belong to v3
+
+This means:
+- `lockers` API helps enumerate `lock_id`
+- contract call provides the actual lock fields
+
 ## Direct request snippets
 
 ### Fetch JSON safely
