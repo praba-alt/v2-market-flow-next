@@ -1,5 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Script from "next/script";
+import {
+  getChainName,
+  getDefaultEvmRpcUrl,
+  getPinksaleLaunchpadUrl
+} from "../lib/pinksale-chains";
 
 const PAGE_SIZE = 20;
 
@@ -20,27 +25,6 @@ function mapPoolTypeToDisplay(rawPoolType) {
   return "Presale";
 }
 
-const CHAIN_ID_TO_NAME = {
-  1: "Ethereum",
-  56: "BNB Chain",
-  137: "Polygon",
-  42161: "Arbitrum",
-  8453: "Base",
-  7000: "ZetaChain",
-  501424: "Solana",
-  3797: "Alvey"
-};
-
-const EVM_RPC_BY_CHAIN_ID = {
-  1: "https://ethereum.publicnode.com",
-  56: "https://bsc-dataseed.binance.org/",
-  137: "https://polygon-bor.publicnode.com",
-  42161: "https://arbitrum-one.publicnode.com",
-  8453: "https://base.publicnode.com",
-  7000: "https://zetachain-evm.blockpi.network/v1/rpc/public",
-  3797: "https://rpc.alvey.io"
-};
-
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const NON_EVM_RPC_PROXY = "/api/non-evm-rpc";
 const SOLANA_WRAPPED_SOL_MINT =
@@ -50,51 +34,9 @@ const PRESALE_POOL_ABI = [
   "function poolStates() view returns (uint8 state, uint256 finishTime, uint256 totalRaised, uint256 totalCommitted, uint256 totalVolumePurchased, uint256 liquidityUnlockTime, int256 lockId, string poolDetails, string kycDetails)"
 ];
 
-function getChainName(chainId) {
-  const n = Number(chainId);
-  if (!Number.isFinite(n)) return String(chainId ?? "-");
-  return CHAIN_ID_TO_NAME[n] || `Chain ${n}`;
-}
-
 function makePoolKey(chainId, addr) {
   if (!chainId || !addr || typeof addr !== "string") return null;
   return String(chainId) + ":" + addr.toLowerCase();
-}
-
-function getChainSlug(chainId) {
-  const n = Number(chainId);
-  if (!Number.isFinite(n)) return null;
-  if (n === 1) return "eth";
-  if (n === 56) return "bsc";
-  if (n === 137) return "polygon";
-  if (n === 42161) return "arbitrum";
-  if (n === 8453) return "base";
-  if (n === 7000) return "zetachain";
-  if (n === 3797) return "alvey";
-  if (n === 501424) return "solana";
-  return null;
-}
-
-function getPinksaleLaunchpadUrl(chainId, poolAddress) {
-  const slug = getChainSlug(chainId);
-  if (!slug || !poolAddress) {
-    return (
-      "https://www.pinksale.finance/launchpad/" +
-      encodeURIComponent(poolAddress || "")
-    );
-  }
-  if (slug === "solana") {
-    return (
-      "https://www.pinksale.finance/solana/launchpad/" +
-      encodeURIComponent(poolAddress)
-    );
-  }
-  return (
-    "https://www.pinksale.finance/launchpad/" +
-    slug +
-    "/" +
-    encodeURIComponent(poolAddress)
-  );
 }
 
 function getLocalDetailUrl(chainId, poolAddress) {
@@ -220,14 +162,64 @@ function pad2(n) {
   return n.toString().padStart(2, "0");
 }
 
+function normalizeChainId(chainId) {
+  const value = Number(chainId);
+  return Number.isFinite(value) ? value : null;
+}
+
+function matchesStatusFilter(doc, filter, nowSec) {
+  const pool = doc?.pool || {};
+  const state = pool.state != null ? Number(pool.state) : null;
+  const startTimeSec = pool.startTime != null ? Number(pool.startTime) : null;
+  const endTimeSec = pool.endTime != null ? Number(pool.endTime) : null;
+  const inWindow =
+    startTimeSec != null &&
+    endTimeSec != null &&
+    startTimeSec > 0 &&
+    endTimeSec > 0 &&
+    nowSec >= startTimeSec &&
+    nowSec < endTimeSec;
+
+  if (filter === "LIVE") {
+    return inWindow && state !== 2;
+  }
+
+  if (filter === "UPCOMING") {
+    if (startTimeSec != null && startTimeSec > 0) {
+      return nowSec < startTimeSec && state !== 2;
+    }
+    return state === 0;
+  }
+
+  return true;
+}
+
+function matchesSelectedChains(doc, selectedChainIdSet) {
+  if (!selectedChainIdSet) return true;
+  const chainId = normalizeChainId(doc?.chainId);
+  return chainId != null && selectedChainIdSet.has(chainId);
+}
+
+function getChainFilterLabel(chainOptions, selectedChainIds, allChainsSelected) {
+  if (!chainOptions.length || allChainsSelected) return "All chains";
+  if (!selectedChainIds.length) return "No chains";
+  if (selectedChainIds.length === 1) {
+    return getChainName(selectedChainIds[0]);
+  }
+  return `${selectedChainIds.length} selected`;
+}
+
 export default function MarketFlowV2Page() {
   const [page, setPage] = useState(1);
   const [allDocs, setAllDocs] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [filter, setFilter] = useState("ALL"); // ALL | LIVE | UPCOMING
+  const [selectedChainIds, setSelectedChainIds] = useState(null);
+  const [chainFilterOpen, setChainFilterOpen] = useState(false);
   const [liveOverrides, setLiveOverrides] = useState({});
   const [nowMs, setNowMs] = useState(Date.now());
+  const chainFilterRef = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -275,36 +267,65 @@ export default function MarketFlowV2Page() {
     return () => clearInterval(id);
   }, []);
 
-  const filteredDocs = allDocs.filter((d) => {
-    const pool = d.pool || {};
-    const state =
-      pool.state != null ? Number(pool.state) : null;
-    const startTimeSec =
-      pool.startTime != null ? Number(pool.startTime) : null;
-    const endTimeSec =
-      pool.endTime != null ? Number(pool.endTime) : null;
-    const nowSec = nowMs / 1000;
-    const inWindow =
-      startTimeSec != null &&
-      endTimeSec != null &&
-      startTimeSec > 0 &&
-      endTimeSec > 0 &&
-      nowSec >= startTimeSec &&
-      nowSec < endTimeSec;
+  const chainOptions = useMemo(() => {
+    const counts = new Map();
 
-    if (filter === "LIVE") {
-      // Live when in time window and not cancelled.
-      return inWindow && state !== 2;
+    for (const doc of allDocs) {
+      const chainId = normalizeChainId(doc?.chainId);
+      if (chainId == null) continue;
+      counts.set(chainId, (counts.get(chainId) || 0) + 1);
     }
-    if (filter === "UPCOMING") {
-      // Upcoming when before start time and not cancelled.
-      if (startTimeSec != null && startTimeSec > 0) {
-        return nowSec < startTimeSec && state !== 2;
+
+    return Array.from(counts.entries())
+      .map(([chainId, count]) => ({
+        chainId,
+        count,
+        name: getChainName(chainId)
+      }))
+      .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name) || a.chainId - b.chainId);
+  }, [allDocs]);
+
+  const allChainIds = useMemo(() => chainOptions.map((option) => option.chainId), [chainOptions]);
+
+  const selectedChainIdList = useMemo(() => {
+    if (selectedChainIds === null) return allChainIds;
+
+    const allowedIds = new Set(allChainIds);
+    return selectedChainIds.filter((chainId) => allowedIds.has(chainId));
+  }, [selectedChainIds, allChainIds]);
+
+  const allChainsSelected =
+    selectedChainIds === null || selectedChainIdList.length === allChainIds.length;
+
+  const selectedChainIdSet = useMemo(() => {
+    if (selectedChainIds === null) return null;
+    return new Set(selectedChainIdList);
+  }, [selectedChainIds, selectedChainIdList]);
+
+  const chainFilterLabel = useMemo(
+    () => getChainFilterLabel(chainOptions, selectedChainIdList, allChainsSelected),
+    [chainOptions, selectedChainIdList, allChainsSelected]
+  );
+
+  useEffect(() => {
+    if (!chainFilterOpen) return undefined;
+
+    function handleMouseDown(event) {
+      if (chainFilterRef.current && !chainFilterRef.current.contains(event.target)) {
+        setChainFilterOpen(false);
       }
-      return state === 0;
     }
-    return true;
-  });
+
+    document.addEventListener("mousedown", handleMouseDown);
+    return () => document.removeEventListener("mousedown", handleMouseDown);
+  }, [chainFilterOpen]);
+
+  const filteredDocs = useMemo(() => {
+    const nowSec = nowMs / 1000;
+    return allDocs.filter(
+      (doc) => matchesStatusFilter(doc, filter, nowSec) && matchesSelectedChains(doc, selectedChainIdSet)
+    );
+  }, [allDocs, filter, nowMs, selectedChainIdSet]);
 
   const totalPages =
     filteredDocs.length > 0
@@ -320,13 +341,36 @@ export default function MarketFlowV2Page() {
   const canPrev = currentPage > 1;
   const canNext = currentPage < totalPages;
 
+  function handleToggleAllChains() {
+    setSelectedChainIds(allChainsSelected ? [] : null);
+    setPage(1);
+  }
+
+  function handleToggleChain(chainId) {
+    setSelectedChainIds((prev) => {
+      const availableIds = allChainIds;
+      const baseIds =
+        prev === null
+          ? availableIds
+          : prev.filter((value) => availableIds.includes(value));
+
+      if (baseIds.includes(chainId)) {
+        return baseIds.filter((value) => value !== chainId);
+      }
+
+      const nextIds = [...baseIds, chainId].sort((a, b) => a - b);
+      return nextIds.length === availableIds.length ? null : nextIds;
+    });
+    setPage(1);
+  }
+
   useEffect(() => {
     let stopped = false;
 
     async function fetchPoolFromRpc(doc) {
       const pool = doc.pool || {};
       const currency = doc.currency || {};
-      const chainId = doc.chainId;
+      const chainId = normalizeChainId(doc?.chainId);
       const poolAddress = pool.address;
 
       // Solana (chainId 501424): use Solana RPC to read WSOL/SPL raised.
@@ -472,7 +516,7 @@ export default function MarketFlowV2Page() {
       if (typeof window === "undefined" || !window.ethers) return null;
       const { ethers } = window;
 
-      const rpcUrl = EVM_RPC_BY_CHAIN_ID[chainId];
+      const rpcUrl = getDefaultEvmRpcUrl(chainId);
       if (!rpcUrl || !poolAddress) return null;
 
       try {
@@ -534,34 +578,9 @@ export default function MarketFlowV2Page() {
       // Recompute the slice of docs for the current filter + page,
       // but do not depend on nowMs/stateful filteredDocs to avoid
       // recreating the interval every second.
-      let docsForFilter = allDocs;
-      if (filter === "LIVE" || filter === "UPCOMING") {
-        docsForFilter = allDocs.filter((d) => {
-          const pool = d.pool || {};
-          const state =
-            pool.state != null ? Number(pool.state) : null;
-          const startTimeSec =
-            pool.startTime != null ? Number(pool.startTime) : null;
-          const endTimeSec =
-            pool.endTime != null ? Number(pool.endTime) : null;
-          const inWindow =
-            startTimeSec != null &&
-            endTimeSec != null &&
-            startTimeSec > 0 &&
-            endTimeSec > 0 &&
-            nowSec >= startTimeSec &&
-            nowSec < endTimeSec;
-
-          if (filter === "LIVE") {
-            return inWindow && state !== 2;
-          }
-          // UPCOMING
-          if (startTimeSec != null && startTimeSec > 0) {
-            return nowSec < startTimeSec && state !== 2;
-          }
-          return state === 0;
-        });
-      }
+      const docsForFilter = allDocs.filter(
+        (doc) => matchesStatusFilter(doc, filter, nowSec) && matchesSelectedChains(doc, selectedChainIdSet)
+      );
 
       const localTotalPages =
         docsForFilter.length > 0
@@ -628,7 +647,7 @@ export default function MarketFlowV2Page() {
       stopped = true;
       clearInterval(id);
     };
-  }, [page, filter, allDocs]);
+  }, [page, filter, allDocs, selectedChainIdSet]);
 
   return (
     <div
@@ -753,6 +772,118 @@ export default function MarketFlowV2Page() {
             </button>
           );
         })}
+        <div
+          ref={chainFilterRef}
+          style={{ position: "relative" }}
+        >
+          <button
+            onClick={() => setChainFilterOpen((open) => !open)}
+            style={{
+              padding: "0.25rem 0.7rem",
+              borderRadius: 999,
+              border: chainFilterOpen
+                ? "1px solid #38bdf8"
+                : "1px solid #4b5563",
+              background: chainFilterOpen ? "#0f172a" : "#020617",
+              color: "#e5e7eb",
+              fontSize: "0.8rem",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              gap: "0.45rem"
+            }}
+          >
+            <span>Chains: {chainFilterLabel}</span>
+            <span style={{ color: "#9ca3af", fontSize: "0.72rem" }}>
+              {chainFilterOpen ? "▲" : "▼"}
+            </span>
+          </button>
+
+          {chainFilterOpen && (
+            <div
+              style={{
+                position: "absolute",
+                top: "calc(100% + 0.5rem)",
+                left: 0,
+                width: 260,
+                maxHeight: 320,
+                overflowY: "auto",
+                padding: "0.55rem",
+                borderRadius: "0.75rem",
+                border: "1px solid #1f2937",
+                background: "#0f172a",
+                boxShadow: "0 18px 48px rgba(2, 6, 23, 0.55)",
+                zIndex: 20
+              }}
+            >
+              <label
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "0.5rem",
+                  padding: "0.4rem 0.45rem",
+                  borderRadius: "0.55rem",
+                  background: allChainsSelected ? "#111827" : "transparent",
+                  color: "#e5e7eb",
+                  cursor: "pointer",
+                  marginBottom: "0.35rem"
+                }}
+              >
+                <span style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                  <input
+                    type="checkbox"
+                    checked={allChainsSelected}
+                    onChange={handleToggleAllChains}
+                  />
+                  <span>All chains</span>
+                </span>
+                <span style={{ fontSize: "0.75rem", color: "#9ca3af" }}>
+                  {allDocs.length}
+                </span>
+              </label>
+
+              <div
+                style={{
+                  borderTop: "1px solid #1f2937",
+                  paddingTop: "0.35rem"
+                }}
+              >
+                {chainOptions.map((option) => {
+                  const checked = allChainsSelected || selectedChainIdSet?.has(option.chainId);
+                  return (
+                    <label
+                      key={option.chainId}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "0.5rem",
+                        padding: "0.38rem 0.45rem",
+                        borderRadius: "0.55rem",
+                        background: checked ? "#111827" : "transparent",
+                        color: "#e5e7eb",
+                        cursor: "pointer"
+                      }}
+                    >
+                      <span style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(checked)}
+                          onChange={() => handleToggleChain(option.chainId)}
+                        />
+                        <span>{option.name}</span>
+                      </span>
+                      <span style={{ fontSize: "0.75rem", color: "#9ca3af" }}>
+                        {option.count}
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       <div

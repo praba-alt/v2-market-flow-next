@@ -1,5 +1,10 @@
 import { useRouter } from "next/router";
 import { useEffect, useMemo, useState } from "react";
+import {
+  getChainSlug,
+  getPinksaleLaunchpadUrl,
+  isEvmChain
+} from "../lib/pinksale-chains";
 
 const FIXED_COLORS = {
   Presale: "#fd728f",
@@ -55,24 +60,6 @@ function getConicGradient(stops) {
   return `conic-gradient(${parts.join(", ")})`;
 }
 
-function getChainSlugForTokenomics(chainId) {
-  const n = Number(chainId);
-  if (n === 1) return "eth";
-  if (n === 56) return "bsc";
-  if (n === 137) return "polygon";
-  if (n === 42161) return "arbitrum";
-  if (n === 8453) return "base";
-  if (n === 7000) return "zetachain";
-  if (n === 501424) return "solana";
-  if (n === 3797) return "alvey";
-  return "bsc";
-}
-
-function isEvmChain(chainId) {
-  const n = Number(chainId);
-  return n !== 501424 && Number.isFinite(n);
-}
-
 function toBigIntSafe(v) {
   if (v == null) return 0n;
   if (typeof v === "bigint") return v;
@@ -115,15 +102,6 @@ function buildBasicSegmentsFromRisk(doc) {
     { label: "Liquidity", value: pct6(liquidity, totalSupply) },
     { label: "Unlocked", value: pct6(unlocked, totalSupply) }
   ].filter((x) => x.value > 0);
-}
-
-function getPinksaleLaunchpadUrl(chainId, poolAddress) {
-  const n = Number(chainId);
-  if (n === 501424) {
-    return `https://www.pinksale.finance/solana/launchpad/${encodeURIComponent(poolAddress || "")}`;
-  }
-  const slug = getChainSlugForTokenomics(chainId);
-  return `https://www.pinksale.finance/launchpad/${slug}/${encodeURIComponent(poolAddress || "")}`;
 }
 
 function addGroupingSeparators(text) {
@@ -419,11 +397,14 @@ export default function PoolDetailsPage() {
       setTokError("");
       try {
         const qs = new URLSearchParams({
-          chain: getChainSlugForTokenomics(chainId),
           chainId: String(chainId),
           poolAddress,
           _ts: String(Date.now())
         });
+        const chainSlug = getChainSlug(chainId);
+        if (chainSlug) {
+          qs.set("chain", chainSlug);
+        }
         const res = await fetch(`/api/pinksale-tokenomics?${qs.toString()}`, {
           cache: "no-store"
         });

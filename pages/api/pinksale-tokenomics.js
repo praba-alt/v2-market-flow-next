@@ -1,4 +1,9 @@
 import { callNonEvmRpc } from "../../lib/non-evm-rpc";
+import {
+  PINKSALE_CHAIN_CONFIG,
+  getChainSlug,
+  getPinksaleLaunchpadUrl
+} from "../../lib/pinksale-chains";
 
 function parseNextData(html) {
   const marker = '<script id="__NEXT_DATA__" type="application/json">';
@@ -59,16 +64,20 @@ async function fetchJsonTry(url, headers) {
   }
 }
 
-const EVM_RPC_BY_CHAIN_ID = {
-  1: process.env.ETHEREUM_RPC_URL || "https://ethereum.publicnode.com",
-  56: process.env.BSC_RPC_URL || "https://bsc-dataseed.binance.org/",
-  97: process.env.BSC_TESTNET_RPC_URL || "https://data-seed-prebsc-1-s1.binance.org:8545/",
-  137: process.env.POLYGON_RPC_URL || "https://polygon-bor.publicnode.com",
-  42161: process.env.ARBITRUM_RPC_URL || "https://arbitrum-one.publicnode.com",
-  8453: process.env.BASE_RPC_URL || "https://base.publicnode.com",
-  7000: process.env.ZETACHAIN_RPC_URL || "https://zetachain-evm.blockpi.network/v1/rpc/public",
-  3797: process.env.ALVEY_RPC_URL || "https://rpc.alvey.io"
-};
+function toJinaProxyUrl(url) {
+  const stripped = String(url || "").replace(/^https?:\/\//, "");
+  return `https://r.jina.ai/http://${stripped}`;
+}
+
+const EVM_RPC_BY_CHAIN_ID = Object.fromEntries(
+  Object.values(PINKSALE_CHAIN_CONFIG)
+    .filter((config) => config?.family === "evm")
+    .map((config) => [
+      config.chainId,
+      (config.rpcEnvVar ? process.env[config.rpcEnvVar] : "") || config.defaultRpcUrl || ""
+    ])
+    .filter(([, rpcUrl]) => Boolean(rpcUrl))
+);
 
 const EVM_PINKLOCK_BY_CHAIN_ID = {
   1: {
@@ -215,12 +224,24 @@ function decodePinklockRecord(resultHex) {
   if (!headStart || headStart + 11 * 64 > clean.length) return null;
 
   const readWord = (slot) => clean.slice(headStart + slot * 64, headStart + (slot + 1) * 64);
+  const amount = hexToBigIntSafe(readWord(3));
+  const lockDate = toPositiveSafeNumber(hexToBigIntSafe(readWord(4)));
+  const tgeDate = toPositiveSafeNumber(hexToBigIntSafe(readWord(5)));
+  const tgePercentBps = toPositiveSafeNumber(hexToBigIntSafe(readWord(6)));
   const cycle = toPositiveSafeNumber(hexToBigIntSafe(readWord(7)));
+  const cycleReleasePercentBps = toPositiveSafeNumber(hexToBigIntSafe(readWord(8)));
+  const unlockedAmount = hexToBigIntSafe(readWord(9));
   const descriptionOffset = toPositiveSafeNumber(hexToBigIntSafe(readWord(10)));
   const description = decodeAbiString(clean, tupleByteOffset, descriptionOffset);
 
   return {
+    amount: amount.toString(),
+    lockDate,
+    tgeDate,
+    tgePercentBps,
     cycle,
+    cycleReleasePercentBps,
+    unlockedAmount: unlockedAmount.toString(),
     description,
     title: extractPinklockTitle(description)
   };
@@ -636,20 +657,17 @@ function mapTokenomicsWithLockRecords(pageProps, lockRecords) {
 }
 
 export default async function handler(req, res) {
-  const chain = String(req.query.chain || "bsc");
-  const chainId = String(req.query.chainId || "56");
+  const requestedChainId = Number(req.query.chainId || "56");
+  const resolvedChainId = Number.isFinite(requestedChainId) ? requestedChainId : 56;
+  const chainId = String(resolvedChainId);
+  const chain = String(getChainSlug(resolvedChainId) || req.query.chain || "bsc");
   const poolAddress = String(
     req.query.poolAddress || "0x35C79c669a44dAC0c07Cee032b7ab84e3368F359"
   );
-  const isSolana = String(chain).toLowerCase() === "solana" || String(chainId) === "501424";
-  const target = isSolana
-    ? `https://www.pinksale.finance/solana/launchpad/${poolAddress}`
-    : `https://www.pinksale.finance/launchpad/${chain}/${poolAddress}`;
+  const target = getPinksaleLaunchpadUrl(resolvedChainId, poolAddress);
   const fullInfoUrl = `https://api.pinksale.finance/api/v1/pool/full_info?chainId=${chainId}&poolAddress=${poolAddress}`;
   const fullInfoProxyUrl = `https://r.jina.ai/http://api.pinksale.finance/api/v1/pool/full_info?chainId=${chainId}&poolAddress=${poolAddress}`;
-  const targetProxy = isSolana
-    ? `https://r.jina.ai/http://www.pinksale.finance/solana/launchpad/${poolAddress}`
-    : `https://r.jina.ai/http://www.pinksale.finance/launchpad/${chain}/${poolAddress}`;
+  const targetProxy = toJinaProxyUrl(target);
 
   try {
     let pageProps = null;
@@ -727,15 +745,15 @@ export default async function handler(req, res) {
     const lockableDocs = lockerDocs
       .map((doc) => {
         const lockId = String(doc?.lock_id || "");
-        const amount = toBigIntSafe(doc?.amount);
-        const unlocked = toBigIntSafe(doc?.unlocked_amount);
-        const currentLockedAmount = amount > unlocked ? amount - unlocked : 0n;
-        return { doc, lockId, amount, unlocked, currentLockedAmount };
+        const apiAmount = toBigIntSafe(doc?.amount);
+        const apiUnlocked = toBigIntSafe(doc?.unlocked_amount);
+        const apiCurrentLockedAmount = apiAmount > apiUnlocked ? apiAmount - apiUnlocked : 0n;
+        return { doc, lockId, apiAmount, apiUnlocked, apiCurrentLockedAmount };
       })
       .filter((entry) => entry.lockId);
 
     const lockRecords = await Promise.all(
-      lockableDocs.map(async ({ doc, lockId, amount, unlocked, currentLockedAmount }) => {
+      lockableDocs.map(async ({ doc, lockId, apiAmount, apiUnlocked, apiCurrentLockedAmount }) => {
         const resolvedChainId = Number(doc?.chain_id || chainId);
         let title =
           doc?.solana_details?.locker_title ||
@@ -747,6 +765,9 @@ export default async function handler(req, res) {
         let expiredAt = toPositiveSafeNumber(doc?.expired);
         let tgePercentBps = 0;
         let cycleReleasePercentBps = 0;
+        let amount = apiAmount;
+        let unlocked = apiUnlocked;
+        let currentLockedAmount = apiCurrentLockedAmount;
 
         if (isSupportedEvmChain(resolvedChainId)) {
           const record = await fetchPinklockRecordOnChain({
@@ -756,14 +777,24 @@ export default async function handler(req, res) {
           });
           if (record) {
             title = record.title || title;
+            amount = toBigIntSafe(record.amount) || amount;
+            unlocked = toBigIntSafe(record.unlockedAmount);
+            currentLockedAmount = amount > unlocked ? amount - unlocked : 0n;
             cycleSeconds = record.cycle || 0;
             cycleUnit = getPinklockCycleUnit(resolvedChainId);
             cycleValue = normalizePinklockCycleValue(cycleSeconds, resolvedChainId);
+            lockDate = record.lockDate || lockDate;
+            expiredAt = record.tgeDate || expiredAt;
+            tgePercentBps = record.tgePercentBps || 0;
+            cycleReleasePercentBps = record.cycleReleasePercentBps || 0;
           }
         } else if (resolvedChainId === 501424) {
           const record = await fetchSolanaPinklockRecord(doc?.solana_details?.locker_pubkey);
           if (record) {
             title = record.title || title;
+            amount = toBigIntSafe(record.amount) || amount;
+            unlocked = toBigIntSafe(record.unlockedAmount);
+            currentLockedAmount = amount > unlocked ? amount - unlocked : 0n;
             cycleSeconds = record.cycleSeconds || 0;
             cycleUnit = "days";
             cycleValue = normalizePinklockCycleValue(cycleSeconds, resolvedChainId);
