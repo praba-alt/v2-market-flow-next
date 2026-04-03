@@ -5,19 +5,6 @@ import {
   getPinksaleLaunchpadUrl
 } from "../../lib/pinksale-chains";
 
-function parseNextData(html) {
-  const marker = '<script id="__NEXT_DATA__" type="application/json">';
-  const start = html.indexOf(marker);
-  if (start < 0) return null;
-
-  const jsonStart = start + marker.length;
-  const end = html.indexOf("</script>", jsonStart);
-  if (end < 0) return null;
-
-  const raw = html.slice(jsonStart, end).trim();
-  return JSON.parse(raw);
-}
-
 function parsePossiblyWrappedJson(text) {
   if (!text) return null;
   const trimmed = text.trim();
@@ -64,11 +51,6 @@ async function fetchJsonTry(url, headers) {
   }
 }
 
-function toJinaProxyUrl(url) {
-  const stripped = String(url || "").replace(/^https?:\/\//, "");
-  return `https://r.jina.ai/http://${stripped}`;
-}
-
 const EVM_RPC_BY_CHAIN_ID = Object.fromEntries(
   Object.values(PINKSALE_CHAIN_CONFIG)
     .filter((config) => config?.family === "evm")
@@ -87,10 +69,6 @@ const PINKSALE_POOL_CACHE = new Map();
 const PINKSALE_POOL_INFLIGHT = new Map();
 const PINKSALE_LOCKERS_CACHE = new Map();
 const PINKSALE_LOCKERS_INFLIGHT = new Map();
-const PINKSALE_RECORD_PAGE_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
-const PINKSALE_RECORD_PAGE_STALE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const PINKSALE_RECORD_PAGE_CACHE = new Map();
-const PINKSALE_RECORD_PAGE_INFLIGHT = new Map();
 
 const EVM_PINKLOCK_BY_CHAIN_ID = {
   1: {
@@ -578,47 +556,6 @@ function parseCycleDays(text) {
   return m ? Number(m[1]) : 0;
 }
 
-function parseDecimalToUnits(value, decimals) {
-  const raw = String(value || "").trim().replace(/,/g, "");
-  if (!raw) return 0n;
-  const match = raw.match(/^(\d+)(?:\.(\d+))?$/);
-  if (!match) return 0n;
-
-  const whole = match[1] || "0";
-  const fractionalRaw = match[2] || "";
-  const normalizedDecimals = Math.max(0, Number(decimals) || 0);
-  const fractional = fractionalRaw.slice(0, normalizedDecimals).padEnd(normalizedDecimals, "0");
-  return BigInt(whole + fractional);
-}
-
-function parseTokenAmountTextToUnits(text, decimals) {
-  const match = String(text || "").match(/[\d,.]+/);
-  return match ? parseDecimalToUnits(match[0], decimals) : 0n;
-}
-
-function parsePercentTextToBps(text) {
-  const match = String(text || "").match(/[\d.]+/);
-  if (!match) return 0;
-  const value = Number(match[0]);
-  return Number.isFinite(value) && value > 0 ? Math.round(value * 100) : 0;
-}
-
-function parsePinkSaleUtcDate(text) {
-  const match = String(text || "").match(/(\d{4})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2})\s+UTC/);
-  if (!match) return 0;
-
-  const [, year, month, day, hour, minute] = match;
-  const timestamp = Date.UTC(
-    Number(year),
-    Number(month) - 1,
-    Number(day),
-    Number(hour),
-    Number(minute),
-    0
-  );
-  return Number.isFinite(timestamp) ? Math.trunc(timestamp / 1000) : 0;
-}
-
 function firstNonEmptyString(...values) {
   for (const value of values) {
     if (typeof value === "string" && value.trim()) return value.trim();
@@ -855,12 +792,7 @@ function mergeOnChainTokenSnapshot(pageProps, tokenSnapshot) {
   };
 }
 
-async function fetchPinksalePoolBootstrap({
-  cacheKey,
-  fullInfoUrl,
-  fullInfoProxyUrl,
-  targetProxy
-}) {
+async function fetchPinksalePoolBootstrap({ cacheKey, fullInfoUrl, fullInfoProxyUrl }) {
   return getCachedBootstrapValue({
     cache: PINKSALE_POOL_CACHE,
     inflight: PINKSALE_POOL_INFLIGHT,
@@ -900,21 +832,6 @@ async function fetchPinksalePoolBootstrap({
         }
       } catch {}
 
-      try {
-        const upstream = await fetchText(targetProxy, {
-          Accept: "text/plain"
-        });
-        if (upstream.ok) {
-          const nextData = parseNextData(upstream.text);
-          if (nextData?.props?.pageProps) {
-            return {
-              value: nextData.props.pageProps,
-              sourceMode: "page-proxied"
-            };
-          }
-        }
-      } catch {}
-
       return null;
     }
   });
@@ -947,89 +864,6 @@ async function fetchPinksaleLockersBootstrap({ cacheKey, lockersUrl, lockersProx
       return null;
     }
   });
-}
-
-function parsePinklockRecordPage(text, tokenDecimals, lockId) {
-  const lines = String(text || "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const labels = new Set([
-    "Token Address",
-    "Token Name",
-    "Token Symbol",
-    "Token Decimals",
-    "Title",
-    "Total Amount Locked",
-    "Total Values Locked",
-    "Owner",
-    "Lock Date",
-    "TGE Date",
-    "TGE Percent",
-    "Cycle",
-    "Cycle Release Percent",
-    "Unlocked Amount",
-    "Vesting Info"
-  ]);
-
-  const readValueAfterLabel = (label) => {
-    const index = lines.findIndex((line) => line === label);
-    if (index < 0) return "";
-    const candidate = lines[index + 1] || "";
-    if (!candidate || labels.has(candidate) || candidate.startsWith("## ")) return "";
-    return candidate;
-  };
-
-  const title = readValueAfterLabel("Title");
-  const cycleText = readValueAfterLabel("Cycle");
-  const cycleValue = parseCycleDays(cycleText);
-  const amount = parseTokenAmountTextToUnits(readValueAfterLabel("Total Amount Locked"), tokenDecimals);
-  const unlockedAmount = parseTokenAmountTextToUnits(readValueAfterLabel("Unlocked Amount"), tokenDecimals);
-
-  return {
-    lockId,
-    title,
-    amount: amount > 0n ? amount.toString() : "",
-    unlockedAmount: unlockedAmount > 0n ? unlockedAmount.toString() : "",
-    lockDate: parsePinkSaleUtcDate(readValueAfterLabel("Lock Date")),
-    tgeDate: parsePinkSaleUtcDate(readValueAfterLabel("TGE Date")),
-    tgePercentBps: parsePercentTextToBps(readValueAfterLabel("TGE Percent")),
-    cycleValue,
-    cycleUnit: "days",
-    cycleSeconds: cycleValue > 0 ? cycleValue * 86400 : 0,
-    cycleReleasePercentBps: parsePercentTextToBps(readValueAfterLabel("Cycle Release Percent"))
-  };
-}
-
-async function fetchPinklockRecordFromPage({ chainId, lockId, tokenDecimals }) {
-  const slug = getChainSlug(chainId);
-  if (!slug || !lockId) return null;
-
-  const recordPageUrl = `https://www.pinksale.finance/pinklock/${slug}/record/${lockId}`;
-  const recordPageProxyUrl = toJinaProxyUrl(recordPageUrl);
-
-  const cached = await getCachedBootstrapValue({
-    cache: PINKSALE_RECORD_PAGE_CACHE,
-    inflight: PINKSALE_RECORD_PAGE_INFLIGHT,
-    cacheKey: makeBootstrapCacheKey(chainId, `record:${lockId}`),
-    freshTtlMs: PINKSALE_RECORD_PAGE_CACHE_TTL_MS,
-    staleTtlMs: PINKSALE_RECORD_PAGE_STALE_TTL_MS,
-    fetchLive: async () => {
-      const proxied = await fetchText(recordPageProxyUrl, { Accept: "text/plain" });
-      if (!proxied.ok) return null;
-
-      const parsed = parsePinklockRecordPage(proxied.text, tokenDecimals, lockId);
-      if (!parsed) return null;
-
-      return {
-        value: parsed,
-        sourceMode: "page-proxied"
-      };
-    }
-  });
-
-  return cached?.value || null;
 }
 
 function mapTokenomicsWithLockRecords(pageProps, lockRecords) {
@@ -1233,22 +1067,20 @@ export default async function handler(req, res) {
   const target = getPinksaleLaunchpadUrl(resolvedChainId, poolAddress);
   const fullInfoUrl = `https://api.pinksale.finance/api/v1/pool/full_info?chainId=${chainId}&poolAddress=${poolAddress}`;
   const fullInfoProxyUrl = `https://r.jina.ai/http://api.pinksale.finance/api/v1/pool/full_info?chainId=${chainId}&poolAddress=${poolAddress}`;
-  const targetProxy = toJinaProxyUrl(target);
   const poolCacheKey = makeBootstrapCacheKey(chainId, poolAddress);
 
   try {
     const poolBootstrap = await fetchPinksalePoolBootstrap({
       cacheKey: poolCacheKey,
       fullInfoUrl,
-      fullInfoProxyUrl,
-      targetProxy
+      fullInfoProxyUrl
     });
 
     if (!poolBootstrap?.value) {
       res.status(502).json({
         error: "Failed to fetch/parse PinkSale live data",
         target,
-        attempted: [fullInfoUrl, fullInfoProxyUrl, targetProxy]
+        attempted: [fullInfoUrl, fullInfoProxyUrl]
       });
       return;
     }
@@ -1298,10 +1130,6 @@ export default async function handler(req, res) {
           const apiUnlocked = toBigIntSafe(doc?.unlocked_amount);
           const apiCurrentLockedAmount = apiAmount > apiUnlocked ? apiAmount - apiUnlocked : 0n;
           const resolvedChainId = Number(candidate?.chainId || doc?.chain_id || chainId);
-          const tokenDecimals =
-            toPositiveSafeNumber(doc?.token_decimals) ||
-            toPositiveSafeNumber(pageProps?.pool?.token?.decimals) ||
-            18;
           let title = firstNonEmptyString(candidate?.title) || resolveLockerDocTitle(doc, lockId);
           let cycleValue = parseCycleDays(title);
           let cycleUnit = "days";
@@ -1347,37 +1175,6 @@ export default async function handler(req, res) {
               expiredAt = record.unlockDate || expiredAt;
               tgePercentBps = record.tgePercentBps || 0;
               cycleReleasePercentBps = record.cycleReleasePercentBps || 0;
-            }
-          }
-
-          if (
-            isSupportedEvmChain(resolvedChainId) &&
-            lockId &&
-            (isGenericLockTitle(title, lockId, Boolean(candidate?.isLiquidity)) ||
-              (!cycleValue && !tgePercentBps && !cycleReleasePercentBps))
-          ) {
-            const pageRecord = await fetchPinklockRecordFromPage({
-              chainId: resolvedChainId,
-              lockId,
-              tokenDecimals
-            });
-            if (pageRecord) {
-              title = pageRecord.title || title;
-              if (pageRecord.amount) {
-                amount = toBigIntSafe(pageRecord.amount) || amount;
-              }
-              if (pageRecord.unlockedAmount) {
-                unlocked = toBigIntSafe(pageRecord.unlockedAmount);
-              }
-              currentLockedAmount = amount > unlocked ? amount - unlocked : 0n;
-              cycleSeconds = pageRecord.cycleSeconds || cycleSeconds;
-              cycleUnit = pageRecord.cycleUnit || cycleUnit;
-              cycleValue = pageRecord.cycleValue || cycleValue;
-              lockDate = pageRecord.lockDate || lockDate;
-              expiredAt = pageRecord.tgeDate || expiredAt;
-              tgePercentBps = pageRecord.tgePercentBps || tgePercentBps;
-              cycleReleasePercentBps =
-                pageRecord.cycleReleasePercentBps || cycleReleasePercentBps;
             }
           }
 

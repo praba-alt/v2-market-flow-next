@@ -1,13 +1,17 @@
 # PinkSale Tokenomics Extraction (Implementation Guide)
 
-This guide explains how to extract tokenomics data from PinkSale with resilient fallbacks and render chart-ready segments.
+This guide explains how to extract tokenomics data from PinkSale with resilient fallbacks, contract/RPC enrichment, and chart-ready output.
 
 ## Objective
 Generate tokenomics chart data with these buckets:
 - `Presale`
 - `Liquidity`
 - `Unlocked`
-- Optional detailed slices (vesting/lock titles) when available
+- Optional detailed slices from lock records when available
+- Separate lock tables for:
+  - `Liquidity Lock Records`
+  - `Vesting Lock Records`
+  - `Cliff Lock Records`
 
 ## Endpoint templates
 
@@ -21,21 +25,43 @@ GET https://api.pinksale.finance/api/v1/pool/full_info?chainId=<CHAIN_ID>&poolAd
 GET https://api.pinksale.finance/api/v1/lockers?chain_id=<CHAIN_ID>&token=<TOKEN_ADDRESS>&limit=100&page=1&sortType=desc
 ```
 
-### 3) Pinklock record page (for title/cycle)
-```txt
-GET https://www.pinksale.finance/pinklock/record/<LOCK_ID>?chain=<CHAIN_SLUG>
-```
-
-### 4) Proxy fallback (for blocked requests)
+### 3) API proxy fallback (for blocked requests)
 ```txt
 https://r.jina.ai/http://api.pinksale.finance/...
-https://r.jina.ai/http://www.pinksale.finance/...
 ```
 
-## Fetch flow (recommended)
-1. Try direct `full_info`.
-2. If blocked/fails, try proxied `full_info`.
-3. If still failing, fetch launchpad HTML and parse `__NEXT_DATA__`.
+## Fetch flow (current recommended order)
+1. Fetch pool bootstrap from PinkSale:
+   - direct `full_info`
+   - proxied `full_info`
+2. Cache the bootstrap response and reuse it aggressively.
+3. Use pool bootstrap as the seed for chain, token, sale params, liquidity lock metadata, and any pool-level locker pointer.
+4. Fetch lock candidates:
+   - first from pool info when available
+   - then from lockers endpoint as supplemental enumeration
+5. Resolve lock details from chain RPC / contract calls whenever possible.
+6. If chain decode is incomplete, keep the generic fallback title rather than scraping pages.
+
+## Source-of-truth rules
+- PinkSale bootstrap is the source for:
+  - sale params
+  - pool type/state metadata
+  - token/currency addresses
+  - liquidity percentage
+  - liquidity lock duration
+  - pool-level locker pointers such as Solana `pool.locker`
+- Chain RPC / contracts are the source for:
+  - token decimals
+  - total supply
+  - lock amount
+  - unlocked amount
+  - current locked amount
+  - TGE percent
+  - cycle
+  - cycle release percent
+  - unlock timestamps
+- If PinkSale text conflicts with a successful contract/account decode, prefer the contract/account decode.
+- Do not emit a lock record row unless it resolved to meaningful lock data.
 
 ## Direct request snippets
 
@@ -58,21 +84,31 @@ function parsePossiblyWrappedJson(text) {
 }
 ```
 
-### Parse `__NEXT_DATA__` from launchpad HTML fallback
-```js
-function parseNextData(html) {
-  const marker = '<script id="__NEXT_DATA__" type="application/json">';
-  const start = html.indexOf(marker);
-  if (start < 0) return null;
-  const jsonStart = start + marker.length;
-  const end = html.indexOf("</script>", jsonStart);
-  if (end < 0) return null;
-  return JSON.parse(html.slice(jsonStart, end).trim());
-}
-```
-
 ## Lock records enrichment
-Use lockers list to get lock IDs, then parse each record page for title/cycle.
+Use a pool-info-first discovery order, then enrich with chain RPC.
+
+### Discovery order
+1. Start from pool bootstrap:
+   - `pool.locker` for Solana pools
+   - `liquidityLockDuration` / `risk.lpLockDays` for synthetic auto-liquidity records
+2. Merge in lockers endpoint docs:
+   - `lock_id`
+   - `solana_details.locker_pubkey`
+   - `amount`
+   - `unlocked_amount`
+   - `lock_date`
+   - `expired`
+   - `lock_version`
+3. Deduplicate candidates by chain + `lockerPubkey` or chain + `lockId`.
+
+### Candidate merge rules
+```js
+pool info            -> seed candidates first
+lockers endpoint     -> supplemental ids, amounts, title hints
+PinkLock contract    -> preferred EVM detail source
+Solana account decode-> preferred Solana detail source
+generic title        -> fallback only
+```
 
 ### Parse title/cycle from Pinklock markdown/text
 ```js
@@ -101,6 +137,50 @@ function parsePinklockRecordMarkdown(markdown) {
 }
 ```
 
+### Generic title handling
+- Generic titles are not enough on their own:
+  - `Lock <id>`
+  - `Liquidity lock`
+- For non-liquidity records, generic titles should not override a more specific contract/account title.
+- If the decoded title is still the generic liquidity label, display `Manual Liquidity Lock`.
+- If no better title is available, `Lock <id>` is acceptable.
+
+### EVM detail resolution
+Use PinkLock `getLockById(lockId)` where chain support exists.
+
+Resolved fields:
+- `amount`
+- `lockDate`
+- `tgeDate`
+- `tgeBps`
+- `cycle`
+- `cycleBps`
+- `unlockedAmount`
+- `description`
+
+Decode `description` as JSON and support PinkSale short-key metadata:
+```js
+function extractPinklockTitle(description) {
+  const parsed = JSON.parse(description);
+  if (typeof parsed.title === "string") return parsed.title.trim();
+  if (typeof parsed.l === "string") return parsed.l.trim(); // PinkSale short key
+  return "";
+}
+```
+
+### Solana detail resolution
+Use Solana account decode when a locker pubkey is available.
+
+Resolved fields:
+- `lockDate`
+- `unlockDate`
+- `cycleSeconds`
+- `tgePercentBps`
+- `cycleReleasePercentBps`
+- `amount`
+- `unlockedAmount`
+- `title`
+
 ### Derive current locked amount
 ```js
 currentLockedAmount = max(amount - unlocked_amount, 0)
@@ -108,12 +188,24 @@ currentLockedAmount = max(amount - unlocked_amount, 0)
 
 ### Classify records
 ```js
-if (cycleDays > 0) {
+if (cycleValue > 0 || tgePercent > 0 || cycleReleasePercent > 0) {
   // vesting record
 } else {
-  // non-vesting lock record
+  // cliff / one-time unlock record
 }
 ```
+
+### Liquidity lock rules
+- Build a synthetic `Auto Listing Liquidity` record from sale params when:
+  - liquidity token amount is known
+  - `liquidityLockDuration > 0`
+  - LP is not burned
+- Unlock time base:
+  - prefer `finishTime`
+  - else `endTime`
+  - else `claimTime`
+- If `finishTime` is not available and `endTime` / `claimTime` is used, mark unlock time as estimated.
+- If LP is burned, suppress liquidity lock status and synthetic liquidity lock record.
 
 ## Numeric helpers
 ```js
@@ -146,6 +238,7 @@ Inputs:
 - `risk.totalLocked`
 - vesting/lock record totals
 - sale params: `hardCap`, `rate`, `currency.decimals`, optional `totalSellingTokens`
+- resolved lock records
 
 ### Presale amount
 ```js
@@ -164,6 +257,14 @@ unlocked = totalSupply - presale - liquidity - burned - locked - vesting;
 if (unlocked < 0) unlocked = 0;
 ```
 
+### Detailed allocation slices
+- Use lock records to split locked/unlocked allocation slices.
+- Labels should be normalized to:
+  - `<Title> (Locked)`
+  - `<Title> (Unlocked)`
+- Presale should remain a plain `Presale` slice.
+- Liquidity gets lock status only when a liquidity lock or safe liquidity state is actually known.
+
 ### Percentages
 ```js
 presalePct   = pct6(presale, totalSupply)
@@ -180,11 +281,34 @@ Use chart-ready normalized output:
 [
   { label: "Presale", percent: <number>, amount: <string> },
   { label: "Liquidity", percent: <number>, amount: <string> },
-  { label: "<Vesting Title A>", percent: <number>, amount: <string> },
-  { label: "<Vesting Title B>", percent: <number>, amount: <string> },
+  { label: "<Allocation Title> (Locked)", percent: <number>, amount: <string> },
+  { label: "<Allocation Title> (Unlocked)", percent: <number>, amount: <string> },
   { label: "Unlocked", percent: <number>, amount: <string> },
   { label: "Burnt", percent: <number>, amount: <string> }
 ]
+```
+
+### API response contract
+Recommended response structure:
+```js
+{
+  source: {
+    mode: "api-direct" | "api-proxied",
+    cacheStatus: "miss" | "fresh" | "refreshed" | "stale",
+    lockersMode: "api-direct" | "api-proxied" | null,
+    lockersCacheStatus: "miss" | "fresh" | "refreshed" | "stale" | null,
+    onChainTokenSource: "rpc" | null
+  },
+  token: { address, symbol, name, decimals },
+  mappedTokenomics: {
+    chartSegments: [...],
+    liquidityLockRecords: [...],
+    vestingRecords: [...],
+    lockRecords: [...]
+  },
+  rawRiskDetails,
+  lockRecords
+}
 ```
 
 ## Chart fallback strategy
@@ -194,6 +318,10 @@ When detailed record data is unavailable, render a basic chart:
 - `Unlocked`
 
 This keeps UI stable even if lock-title enrichment fails.
+
+For non-EVM or degraded cases:
+- if detailed chart segments are unavailable, use risk/basic chart fallback
+- if lock records are unresolved, show no lock rows rather than placeholder junk rows
 
 ## Cache/staleness controls
 Use both for freshest values:
@@ -206,17 +334,41 @@ fetch(url, { cache: "no-store" })
 ? _ts=<Date.now()>
 ```
 
+Current cache strategy:
+- pool bootstrap cache: long TTL, stale fallback allowed
+- lockers bootstrap cache: medium TTL, stale fallback allowed
+- on-chain token snapshot: fetch on request
+
+Design goal:
+- minimize repeated PinkSale hits
+- allow stale PinkSale bootstrap when upstream is flaky
+- keep lock math fresh from RPC where possible
+
 ## Testing checklist
 1. Confirm `full_info` works for selected chain/pool.
-2. Confirm lockers endpoint returns docs for token.
-3. Confirm record page parsing returns title/cycle.
-4. Confirm percentages sum near 100% (small rounding drift is normal).
-5. Confirm fallback chart appears when detailed extraction fails.
+2. Confirm token decimals / total supply can be enriched from RPC.
+3. Confirm pool-info lock hints are used first:
+   - Solana `pool.locker`
+   - liquidity lock duration
+4. Confirm lockers endpoint only supplements candidate discovery.
+5. Confirm EVM `getLockById` returns title/amount/TGE/cycle/unlocked fields where supported.
+6. Confirm Solana account decode returns title/amount/TGE/cycle/unlocked fields where supported.
+7. Confirm generic titles are normalized:
+   - `Manual Liquidity Lock` for generic liquidity descriptions
+8. Confirm percentages sum near 100% (small rounding drift is normal).
+9. Confirm fallback chart appears when detailed extraction fails.
+10. Confirm no unresolved placeholder rows like `Lock 12345` leak into the UI unless no better title exists.
 
 ## Example query
 ```txt
 /api/pinksale-tokenomics?chain=<CHAIN_SLUG>&chainId=<CHAIN_ID>&poolAddress=<POOL_ADDRESS>
 ```
+
+## Chain notes
+- EVM chains use chain-specific PinkLock contract mappings.
+- Solana uses `pool.locker` and account decoding via non-EVM RPC.
+- Non-EVM RPC is currently first-class for Solana only.
+- TON / Sui / other non-EVM chains may have bootstrap coverage before deep lock decoding coverage.
 
 
 ## Donut chart example (minimal)
