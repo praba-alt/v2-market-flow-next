@@ -100,6 +100,14 @@ function getPinksaleLaunchpadUrl(chainId, poolAddress) {
   );
 }
 
+function getLocalDetailUrl(chainId, poolAddress) {
+  const q = new URLSearchParams({
+    chainId: String(chainId || ""),
+    poolAddress: String(poolAddress || "")
+  });
+  return `/details?${q.toString()}`;
+}
+
 function shortAddr(addr, len = 6) {
   if (!addr || typeof addr !== "string") return "";
   if (addr.length <= len * 2 + 3) return addr;
@@ -117,6 +125,64 @@ function formatNumber(x) {
     return (n / 1_000).toFixed(1).replace(/\.0$/, "") + "k";
   }
   return n.toFixed(2).replace(/\.00$/, "");
+}
+
+function toBigIntSafe(v) {
+  if (v == null) return 0n;
+  if (typeof v === "bigint") return v;
+  if (typeof v === "number" && Number.isFinite(v)) return BigInt(Math.floor(v));
+  if (typeof v === "string") {
+    const s = v.trim();
+    if (!s) return 0n;
+    if (/^-?\d+$/.test(s)) return BigInt(s);
+  }
+  return 0n;
+}
+
+function pct6(value, total) {
+  if (total <= 0n) return 0;
+  const scaled = (value * 100000000n) / total;
+  return Number(scaled) / 1000000;
+}
+
+function getCardTokenomicsSegments(doc) {
+  const pool = doc?.pool || {};
+  const token = doc?.token || {};
+  const risk = doc?.riskDetails || pool?.riskDetails || {};
+
+  const totalSupply = toBigIntSafe(risk.totalSupply || token.totalSupply);
+  if (totalSupply <= 0n) return [];
+
+  const liquidity = toBigIntSafe(risk.tokensForLiquidity);
+  const unlocked = toBigIntSafe(risk.totalUnlock);
+  const burnt = toBigIntSafe(risk.totalBurned);
+  const locked = toBigIntSafe(risk.totalLocked);
+
+  let presale = totalSupply - liquidity - unlocked - burnt - locked;
+  if (presale < 0n) presale = 0n;
+
+  const segments = [
+    { label: "Presale", percent: pct6(presale, totalSupply), color: "#fd728f" },
+    { label: "Liquidity", percent: pct6(liquidity, totalSupply), color: "#049bff" },
+    { label: "Unlocked", percent: pct6(unlocked, totalSupply), color: "#ffcd56" }
+  ].filter((x) => x.percent > 0);
+
+  return segments;
+}
+
+function getConicGradient(stops) {
+  if (!stops.length) return "conic-gradient(#334155 0% 100%)";
+  let acc = 0;
+  const chunks = stops.map((s) => {
+    const from = acc;
+    const to = acc + s.value;
+    acc = to;
+    return `${s.color} ${from}% ${to}%`;
+  });
+  if (acc < 100) {
+    chunks.push(`transparent ${acc}% 100%`);
+  }
+  return `conic-gradient(${chunks.join(", ")})`;
 }
 
 function tsToTimeString(tsMs) {
@@ -698,7 +764,7 @@ export default function MarketFlowV2Page() {
           gap: "0.75rem"
         }}
       >
-        {pageDocs.map((e) => {
+        {pageDocs.map((e, idx) => {
           const token = e.token || {};
           const currency = e.currency || {};
           const pool = e.pool || {};
@@ -831,10 +897,26 @@ export default function MarketFlowV2Page() {
           const poolTypeDisplay = mapPoolTypeToDisplay(
             pool.poolType != null ? pool.poolType : pool.pool_type
           );
+          const tokSegments = getCardTokenomicsSegments(e);
+          const tokTotal = tokSegments.reduce((sum, s) => sum + s.percent, 0);
+          const tokGradient =
+            tokTotal > 0
+              ? getConicGradient(
+                  tokSegments.map((s) => ({
+                    color: s.color,
+                    value: (s.percent / tokTotal) * 100
+                  }))
+                )
+              : getConicGradient([]);
+
+          const cardKey =
+            e.eventKey ||
+            makePoolKey(chainId, poolAddress) ||
+            `${e.transactionHash || "tx"}-${e.logIndex ?? "log"}-${startIdx + idx}`;
 
           return (
             <div
-              key={e.eventKey || `${e.transactionHash || ""}-${e.logIndex || ""}`}
+              key={cardKey}
               style={{
                 background: "#111827",
                 borderRadius: "0.75rem",
@@ -890,6 +972,47 @@ export default function MarketFlowV2Page() {
                     )}
                   </div>
                 </div>
+                {tokSegments.length > 0 && (
+                  <div
+                    style={{
+                      display: "grid",
+                      justifyItems: "center",
+                      gap: 4,
+                      minWidth: 70
+                    }}
+                    title={tokSegments
+                      .map((s) => `${s.label}: ${s.percent.toFixed(2)}%`)
+                      .join(" | ")}
+                  >
+                    <div
+                      style={{
+                        width: 58,
+                        height: 58,
+                        borderRadius: "50%",
+                        background: tokGradient,
+                        position: "relative",
+                        border: "1px solid #1f2937"
+                      }}
+                    >
+                      <div
+                        style={{
+                          position: "absolute",
+                          width: 30,
+                          height: 30,
+                          left: "50%",
+                          top: "50%",
+                          transform: "translate(-50%, -50%)",
+                          borderRadius: "50%",
+                          background: "#020617",
+                          border: "1px solid #1f2937"
+                        }}
+                      />
+                    </div>
+                    <div style={{ fontSize: "0.62rem", color: "#9ca3af" }}>
+                      Tokenomics
+                    </div>
+                  </div>
+                )}
                 <div
                   style={{
                     fontSize: "0.8rem",
@@ -1262,6 +1385,32 @@ export default function MarketFlowV2Page() {
                       }}
                     >
                       {shortAddr(poolAddress)}
+                    </a>
+                  ) : (
+                    "-"
+                  )}
+                </strong>
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  fontSize: "0.8rem",
+                  color: "#9ca3af"
+                }}
+              >
+                <span>Details</span>
+                <strong style={{ color: "#e5e7eb", fontWeight: 500 }}>
+                  {poolAddress ? (
+                    <a
+                      href={getLocalDetailUrl(chainId, poolAddress)}
+                      style={{
+                        color: "#60a5fa",
+                        textDecoration: "none"
+                      }}
+                    >
+                      Open
                     </a>
                   ) : (
                     "-"
