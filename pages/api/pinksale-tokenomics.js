@@ -97,6 +97,10 @@ const EVM_PINKLOCK_BY_CHAIN_ID = {
     v2: "0x71B5759d73262FBb223956913ecF4ecC51057641",
     v3: "0x29AEd81d274f94CEa037d05Bb61eB93223A48a77"
   },
+  25: {
+    v2: "0x102137A9F278B013419332f82aCEA429D944Fc34",
+    v3: ""
+  },
   56: {
     v2: "0x407993575c91ce7643a4d4cCACc9A98c36eE1BBE",
     v3: ""
@@ -107,6 +111,34 @@ const EVM_PINKLOCK_BY_CHAIN_ID = {
   },
   137: {
     v2: "0x6C9A0D8B1c7a95a323d744dE30cf027694710633",
+    v3: ""
+  },
+  130: {
+    v2: "0x37deb4Ed95484d9C3e9A8B513EcB1BeBd5f77944",
+    v3: ""
+  },
+  196: {
+    v2: "0xdD6E31A046b828CbBAfb939C2a394629aff8BBdC",
+    v3: ""
+  },
+  250: {
+    v2: "0x0E1757b9d6501e60B2e4Ca0D000e49532948CF6c",
+    v3: ""
+  },
+  369: {
+    v2: "0x8c32f969b7166088E8e809429C516dCA71AD94F5",
+    v3: ""
+  },
+  1116: {
+    v2: "0xdD6E31A046b828CbBAfb939C2a394629aff8BBdC",
+    v3: ""
+  },
+  2000: {
+    v2: "0xdD6E31A046b828CbBAfb939C2a394629aff8BBdC",
+    v3: ""
+  },
+  7171: {
+    v2: "0xA64bd15cAc500a5e40E93F93088A35DC00fE1851",
     v3: ""
   },
   42161: {
@@ -123,6 +155,10 @@ const EVM_PINKLOCK_BY_CHAIN_ID = {
   },
   3797: {
     v2: "0xdD6E31A046b828CbBAfb939C2a394629aff8BBdC",
+    v3: ""
+  },
+  43114: {
+    v2: "0x9479C6484a392113bB829A15E7c9E033C9e70D30",
     v3: ""
   }
 };
