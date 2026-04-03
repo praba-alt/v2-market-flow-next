@@ -79,6 +79,19 @@ const EVM_RPC_BY_CHAIN_ID = Object.fromEntries(
     .filter(([, rpcUrl]) => Boolean(rpcUrl))
 );
 
+const PINKSALE_POOL_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const PINKSALE_POOL_STALE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const PINKSALE_LOCKERS_CACHE_TTL_MS = 60 * 60 * 1000;
+const PINKSALE_LOCKERS_STALE_TTL_MS = 24 * 60 * 60 * 1000;
+const PINKSALE_POOL_CACHE = new Map();
+const PINKSALE_POOL_INFLIGHT = new Map();
+const PINKSALE_LOCKERS_CACHE = new Map();
+const PINKSALE_LOCKERS_INFLIGHT = new Map();
+const PINKSALE_RECORD_PAGE_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const PINKSALE_RECORD_PAGE_STALE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const PINKSALE_RECORD_PAGE_CACHE = new Map();
+const PINKSALE_RECORD_PAGE_INFLIGHT = new Map();
+
 const EVM_PINKLOCK_BY_CHAIN_ID = {
   1: {
     v2: "0x71B5759d73262FBb223956913ecF4ecC51057641",
@@ -93,7 +106,7 @@ const EVM_PINKLOCK_BY_CHAIN_ID = {
     v3: "0x2529e2747d3C570870aA5931AE26E181a60449DD"
   },
   137: {
-    v2: "0x37deb4Ed95484d9C3e9A8B513EcB1BeBd5f77944",
+    v2: "0x6C9A0D8B1c7a95a323d744dE30cf027694710633",
     v3: ""
   },
   42161: {
@@ -115,6 +128,8 @@ const EVM_PINKLOCK_BY_CHAIN_ID = {
 };
 
 const GET_LOCK_BY_ID_SELECTOR = "0x08f12470";
+const ERC20_DECIMALS_SELECTOR = "0x313ce567";
+const ERC20_TOTAL_SUPPLY_SELECTOR = "0x18160ddd";
 const SOLANA_LOCK_LAYOUT = {
   lockDateOffset: 144,
   unlockDateOffset: 152,
@@ -140,6 +155,90 @@ function toPositiveSafeNumber(v) {
 
 function isSupportedEvmChain(chainId) {
   return Boolean(EVM_RPC_BY_CHAIN_ID[Number(chainId)] && EVM_PINKLOCK_BY_CHAIN_ID[Number(chainId)]);
+}
+
+function makeBootstrapCacheKey(chainId, id) {
+  const rawId = String(id || "").trim();
+  const normalizedId = /^0x/i.test(rawId) ? rawId.toLowerCase() : rawId;
+  return `${chainId}:${normalizedId}`;
+}
+
+function getCacheSnapshot(cache, key, freshTtlMs, staleTtlMs) {
+  const entry = cache.get(key);
+  if (!entry) {
+    return {
+      entry: null,
+      ageMs: null,
+      isFresh: false,
+      isStaleUsable: false
+    };
+  }
+
+  const ageMs = Math.max(0, Date.now() - entry.fetchedAtMs);
+  return {
+    entry,
+    ageMs,
+    isFresh: ageMs <= freshTtlMs,
+    isStaleUsable: ageMs <= staleTtlMs
+  };
+}
+
+async function getCachedBootstrapValue({
+  cache,
+  inflight,
+  cacheKey,
+  freshTtlMs,
+  staleTtlMs,
+  fetchLive
+}) {
+  const cached = getCacheSnapshot(cache, cacheKey, freshTtlMs, staleTtlMs);
+  if (cached.isFresh) {
+    return {
+      ...cached.entry,
+      cacheStatus: "fresh",
+      cacheAgeMs: cached.ageMs
+    };
+  }
+
+  let live = null;
+  const inflightRequest = inflight.get(cacheKey);
+  if (inflightRequest) {
+    live = await inflightRequest;
+  } else {
+    const request = (async () => {
+      try {
+        return await fetchLive();
+      } finally {
+        inflight.delete(cacheKey);
+      }
+    })();
+    inflight.set(cacheKey, request);
+    live = await request;
+  }
+
+  if (live?.value != null) {
+    const nextEntry = {
+      value: live.value,
+      sourceMode: live.sourceMode || "live",
+      fetchedAtMs: Date.now()
+    };
+    cache.set(cacheKey, nextEntry);
+    return {
+      ...nextEntry,
+      cacheStatus: cached.entry ? "refreshed" : "miss",
+      cacheAgeMs: 0
+    };
+  }
+
+  if (cached.entry && cached.isStaleUsable) {
+    return {
+      ...cached.entry,
+      cacheStatus: "stale",
+      cacheAgeMs: cached.ageMs
+    };
+  }
+
+  return null;
 }
 
 function getPinklockCycleUnit(chainId) {
@@ -269,6 +368,49 @@ async function callEthereumRpc(rpcUrl, method, params, timeoutMs = 15000) {
   return res.json();
 }
 
+async function fetchEvmTokenSnapshotOnChain(chainId, tokenAddress) {
+  const rpcUrl = EVM_RPC_BY_CHAIN_ID[Number(chainId)];
+  if (!rpcUrl || !tokenAddress) return null;
+
+  try {
+    const [decimalsResult, totalSupplyResult] = await Promise.allSettled([
+      callEthereumRpc(
+        rpcUrl,
+        "eth_call",
+        [{ to: tokenAddress, data: ERC20_DECIMALS_SELECTOR }, "latest"],
+        10000
+      ),
+      callEthereumRpc(
+        rpcUrl,
+        "eth_call",
+        [{ to: tokenAddress, data: ERC20_TOTAL_SUPPLY_SELECTOR }, "latest"],
+        10000
+      )
+    ]);
+
+    const decimalsPayload = decimalsResult.status === "fulfilled" ? decimalsResult.value : null;
+    const totalSupplyPayload = totalSupplyResult.status === "fulfilled" ? totalSupplyResult.value : null;
+    const decimals =
+      typeof decimalsPayload?.result === "string"
+        ? toPositiveSafeNumber(hexToBigIntSafe(decimalsPayload.result))
+        : 0;
+    const totalSupply =
+      typeof totalSupplyPayload?.result === "string"
+        ? hexToBigIntSafe(totalSupplyPayload.result).toString()
+        : "";
+
+    if (!decimals && !totalSupply) return null;
+
+    return {
+      decimals: decimals || null,
+      totalSupply: totalSupply || null,
+      source: "rpc"
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function fetchPinklockRecordOnChain({ chainId, lockId, lockVersion }) {
   const rpcUrl = EVM_RPC_BY_CHAIN_ID[Number(chainId)];
   const pinklockAddress = choosePinklockAddress(chainId, lockVersion, lockId);
@@ -348,6 +490,26 @@ async function fetchSolanaPinklockRecord(lockerPubkey) {
   }
 }
 
+async function fetchSolanaMintSnapshotOnChain(mintAddress) {
+  if (!mintAddress) return null;
+
+  try {
+    const payload = await callNonEvmRpc("solana", "getTokenSupply", [mintAddress], 10000);
+    const amount = payload?.result?.value?.amount;
+    const decimals = payload?.result?.value?.decimals;
+
+    if (typeof amount !== "string" && typeof decimals !== "number") return null;
+
+    return {
+      decimals: typeof decimals === "number" ? decimals : null,
+      totalSupply: typeof amount === "string" ? amount : null,
+      source: "rpc"
+    };
+  } catch {
+    return null;
+  }
+}
+
 function toBigIntSafe(v) {
   if (v == null) return 0n;
   if (typeof v === "bigint") return v;
@@ -376,8 +538,89 @@ function parseCycleDays(text) {
   if (!text) return 0;
   const dayMatch = String(text).match(/(\d+)\s*days?/i);
   if (dayMatch) return Number(dayMatch[1]);
-  const m = String(text).match(/(\d+)/);
+  const m = String(text).match(/cycle(?:\s*\(d\))?\s*[:=-]?\s*(\d+)/i);
   return m ? Number(m[1]) : 0;
+}
+
+function parseDecimalToUnits(value, decimals) {
+  const raw = String(value || "").trim().replace(/,/g, "");
+  if (!raw) return 0n;
+  const match = raw.match(/^(\d+)(?:\.(\d+))?$/);
+  if (!match) return 0n;
+
+  const whole = match[1] || "0";
+  const fractionalRaw = match[2] || "";
+  const normalizedDecimals = Math.max(0, Number(decimals) || 0);
+  const fractional = fractionalRaw.slice(0, normalizedDecimals).padEnd(normalizedDecimals, "0");
+  return BigInt(whole + fractional);
+}
+
+function parseTokenAmountTextToUnits(text, decimals) {
+  const match = String(text || "").match(/[\d,.]+/);
+  return match ? parseDecimalToUnits(match[0], decimals) : 0n;
+}
+
+function parsePercentTextToBps(text) {
+  const match = String(text || "").match(/[\d.]+/);
+  if (!match) return 0;
+  const value = Number(match[0]);
+  return Number.isFinite(value) && value > 0 ? Math.round(value * 100) : 0;
+}
+
+function parsePinkSaleUtcDate(text) {
+  const match = String(text || "").match(/(\d{4})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2})\s+UTC/);
+  if (!match) return 0;
+
+  const [, year, month, day, hour, minute] = match;
+  const timestamp = Date.UTC(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+    0
+  );
+  return Number.isFinite(timestamp) ? Math.trunc(timestamp / 1000) : 0;
+}
+
+function firstNonEmptyString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function isGenericLockTitle(title, lockId, isLiquidity = false) {
+  const normalized = String(title || "").trim().toLowerCase();
+  if (!normalized) return true;
+  if (normalized === String(`Lock ${lockId}`).toLowerCase()) return true;
+  if (!isLiquidity && normalized === "liquidity lock") return true;
+  if (!isLiquidity && normalized === "liquidity lock.") return true;
+  return false;
+}
+
+function getFallbackLockTitle({ lockId, isLiquidity, title }) {
+  const normalized = String(title || "").trim().toLowerCase();
+  if (isLiquidity || normalized === "liquidity lock" || normalized === "liquidity lock.") {
+    return "Manual Liquidity Lock";
+  }
+  return `Lock ${lockId}`;
+}
+
+function resolveLockerDocTitle(doc, lockId) {
+  const parsedDescriptionTitle = extractPinklockTitle(doc?.description);
+  const parsedDescTitle = extractPinklockTitle(doc?.desc);
+  const title = firstNonEmptyString(
+    doc?.solana_details?.locker_title,
+    doc?.locker_title,
+    doc?.title,
+    doc?.name,
+    parsedDescriptionTitle,
+    parsedDescTitle
+  );
+
+  if (title) return title;
+  return doc?.is_liquidity ? "Liquidity Lock" : `Lock ${lockId}`;
 }
 
 function getRecordCycleValue(rec) {
@@ -464,6 +707,211 @@ function buildLiquidityLockRecords({ sale, risk, tokensForLiquidity }) {
       isAutoLiquidityLock: true
     }
   ];
+}
+
+function mergeOnChainTokenSnapshot(pageProps, tokenSnapshot) {
+  if (!pageProps?.pool || !tokenSnapshot) return pageProps;
+
+  const nextPool = {
+    ...pageProps.pool,
+    token: {
+      ...(pageProps.pool.token || {})
+    },
+    riskDetails: {
+      ...(pageProps.pool.riskDetails || {})
+    }
+  };
+
+  if (tokenSnapshot.decimals != null) {
+    nextPool.token.decimals = tokenSnapshot.decimals;
+  }
+
+  if (tokenSnapshot.totalSupply) {
+    nextPool.token.totalSupply = tokenSnapshot.totalSupply;
+    nextPool.riskDetails.totalSupply = tokenSnapshot.totalSupply;
+  }
+
+  return {
+    ...pageProps,
+    pool: nextPool
+  };
+}
+
+async function fetchPinksalePoolBootstrap({
+  cacheKey,
+  fullInfoUrl,
+  fullInfoProxyUrl,
+  targetProxy
+}) {
+  return getCachedBootstrapValue({
+    cache: PINKSALE_POOL_CACHE,
+    inflight: PINKSALE_POOL_INFLIGHT,
+    cacheKey,
+    freshTtlMs: PINKSALE_POOL_CACHE_TTL_MS,
+    staleTtlMs: PINKSALE_POOL_STALE_TTL_MS,
+    fetchLive: async () => {
+      try {
+        const direct = await fetchText(fullInfoUrl, {
+          Accept: "application/json",
+          "User-Agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        });
+        if (direct.ok) {
+          const json = parsePossiblyWrappedJson(direct.text);
+          if (json && typeof json === "object") {
+            return {
+              value: { pool: json },
+              sourceMode: "api-direct"
+            };
+          }
+        }
+      } catch {}
+
+      try {
+        const proxiedApi = await fetchText(fullInfoProxyUrl, {
+          Accept: "text/plain"
+        });
+        if (proxiedApi.ok) {
+          const json = parsePossiblyWrappedJson(proxiedApi.text);
+          if (json && typeof json === "object") {
+            return {
+              value: { pool: json },
+              sourceMode: "api-proxied"
+            };
+          }
+        }
+      } catch {}
+
+      try {
+        const upstream = await fetchText(targetProxy, {
+          Accept: "text/plain"
+        });
+        if (upstream.ok) {
+          const nextData = parseNextData(upstream.text);
+          if (nextData?.props?.pageProps) {
+            return {
+              value: nextData.props.pageProps,
+              sourceMode: "page-proxied"
+            };
+          }
+        }
+      } catch {}
+
+      return null;
+    }
+  });
+}
+
+async function fetchPinksaleLockersBootstrap({ cacheKey, lockersUrl, lockersProxyUrl }) {
+  return getCachedBootstrapValue({
+    cache: PINKSALE_LOCKERS_CACHE,
+    inflight: PINKSALE_LOCKERS_INFLIGHT,
+    cacheKey,
+    freshTtlMs: PINKSALE_LOCKERS_CACHE_TTL_MS,
+    staleTtlMs: PINKSALE_LOCKERS_STALE_TTL_MS,
+    fetchLive: async () => {
+      const direct = await fetchJsonTry(lockersUrl, { Accept: "application/json" });
+      if (direct && typeof direct === "object") {
+        return {
+          value: direct,
+          sourceMode: "api-direct"
+        };
+      }
+
+      const proxied = await fetchJsonTry(lockersProxyUrl, { Accept: "text/plain" });
+      if (proxied && typeof proxied === "object") {
+        return {
+          value: proxied,
+          sourceMode: "api-proxied"
+        };
+      }
+
+      return null;
+    }
+  });
+}
+
+function parsePinklockRecordPage(text, tokenDecimals, lockId) {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const labels = new Set([
+    "Token Address",
+    "Token Name",
+    "Token Symbol",
+    "Token Decimals",
+    "Title",
+    "Total Amount Locked",
+    "Total Values Locked",
+    "Owner",
+    "Lock Date",
+    "TGE Date",
+    "TGE Percent",
+    "Cycle",
+    "Cycle Release Percent",
+    "Unlocked Amount",
+    "Vesting Info"
+  ]);
+
+  const readValueAfterLabel = (label) => {
+    const index = lines.findIndex((line) => line === label);
+    if (index < 0) return "";
+    const candidate = lines[index + 1] || "";
+    if (!candidate || labels.has(candidate) || candidate.startsWith("## ")) return "";
+    return candidate;
+  };
+
+  const title = readValueAfterLabel("Title");
+  const cycleText = readValueAfterLabel("Cycle");
+  const cycleValue = parseCycleDays(cycleText);
+  const amount = parseTokenAmountTextToUnits(readValueAfterLabel("Total Amount Locked"), tokenDecimals);
+  const unlockedAmount = parseTokenAmountTextToUnits(readValueAfterLabel("Unlocked Amount"), tokenDecimals);
+
+  return {
+    lockId,
+    title,
+    amount: amount > 0n ? amount.toString() : "",
+    unlockedAmount: unlockedAmount > 0n ? unlockedAmount.toString() : "",
+    lockDate: parsePinkSaleUtcDate(readValueAfterLabel("Lock Date")),
+    tgeDate: parsePinkSaleUtcDate(readValueAfterLabel("TGE Date")),
+    tgePercentBps: parsePercentTextToBps(readValueAfterLabel("TGE Percent")),
+    cycleValue,
+    cycleUnit: "days",
+    cycleSeconds: cycleValue > 0 ? cycleValue * 86400 : 0,
+    cycleReleasePercentBps: parsePercentTextToBps(readValueAfterLabel("Cycle Release Percent"))
+  };
+}
+
+async function fetchPinklockRecordFromPage({ chainId, lockId, tokenDecimals }) {
+  const slug = getChainSlug(chainId);
+  if (!slug || !lockId) return null;
+
+  const recordPageUrl = `https://www.pinksale.finance/pinklock/${slug}/record/${lockId}`;
+  const recordPageProxyUrl = toJinaProxyUrl(recordPageUrl);
+
+  const cached = await getCachedBootstrapValue({
+    cache: PINKSALE_RECORD_PAGE_CACHE,
+    inflight: PINKSALE_RECORD_PAGE_INFLIGHT,
+    cacheKey: makeBootstrapCacheKey(chainId, `record:${lockId}`),
+    freshTtlMs: PINKSALE_RECORD_PAGE_CACHE_TTL_MS,
+    staleTtlMs: PINKSALE_RECORD_PAGE_STALE_TTL_MS,
+    fetchLive: async () => {
+      const proxied = await fetchText(recordPageProxyUrl, { Accept: "text/plain" });
+      if (!proxied.ok) return null;
+
+      const parsed = parsePinklockRecordPage(proxied.text, tokenDecimals, lockId);
+      if (!parsed) return null;
+
+      return {
+        value: parsed,
+        sourceMode: "page-proxied"
+      };
+    }
+  });
+
+  return cached?.value || null;
 }
 
 function mapTokenomicsWithLockRecords(pageProps, lockRecords) {
@@ -668,60 +1116,17 @@ export default async function handler(req, res) {
   const fullInfoUrl = `https://api.pinksale.finance/api/v1/pool/full_info?chainId=${chainId}&poolAddress=${poolAddress}`;
   const fullInfoProxyUrl = `https://r.jina.ai/http://api.pinksale.finance/api/v1/pool/full_info?chainId=${chainId}&poolAddress=${poolAddress}`;
   const targetProxy = toJinaProxyUrl(target);
+  const poolCacheKey = makeBootstrapCacheKey(chainId, poolAddress);
 
   try {
-    let pageProps = null;
-    let sourceMode = "";
+    const poolBootstrap = await fetchPinksalePoolBootstrap({
+      cacheKey: poolCacheKey,
+      fullInfoUrl,
+      fullInfoProxyUrl,
+      targetProxy
+    });
 
-    // 1) Preferred: direct full_info (often blocked by Cloudflare)
-    try {
-      const direct = await fetchText(fullInfoUrl, {
-        Accept: "application/json",
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-      });
-      if (direct.ok) {
-        const json = parsePossiblyWrappedJson(direct.text);
-        if (json && typeof json === "object") {
-          pageProps = { pool: json };
-          sourceMode = "api-direct";
-        }
-      }
-    } catch {}
-
-    // 2) Fallback: proxied full_info via r.jina.ai
-    if (!pageProps) {
-      try {
-        const proxiedApi = await fetchText(fullInfoProxyUrl, {
-          Accept: "text/plain"
-        });
-        if (proxiedApi.ok) {
-          const json = parsePossiblyWrappedJson(proxiedApi.text);
-          if (json && typeof json === "object") {
-            pageProps = { pool: json };
-            sourceMode = "api-proxied";
-          }
-        }
-      } catch {}
-    }
-
-    // 3) Last fallback: launchpad HTML -> __NEXT_DATA__ (proxied)
-    if (!pageProps) {
-      try {
-        const upstream = await fetchText(targetProxy, {
-          Accept: "text/plain"
-        });
-        if (upstream.ok) {
-          const nextData = parseNextData(upstream.text);
-          if (nextData?.props?.pageProps) {
-            pageProps = nextData.props.pageProps;
-            sourceMode = "page-proxied";
-          }
-        }
-      } catch {}
-    }
-
-    if (!pageProps) {
+    if (!poolBootstrap?.value) {
       res.status(502).json({
         error: "Failed to fetch/parse PinkSale live data",
         target,
@@ -730,18 +1135,35 @@ export default async function handler(req, res) {
       return;
     }
 
+    let pageProps = poolBootstrap.value;
     const tokenAddress = pageProps?.pool?.token?.address || pageProps?.token?.address;
 
-    let lockers = null;
+    let onChainToken = null;
+    if (tokenAddress) {
+      if (EVM_RPC_BY_CHAIN_ID[resolvedChainId]) {
+        onChainToken = await fetchEvmTokenSnapshotOnChain(resolvedChainId, tokenAddress);
+      } else if (resolvedChainId === 501424) {
+        onChainToken = await fetchSolanaMintSnapshotOnChain(tokenAddress);
+      }
+    }
+    if (onChainToken) {
+      pageProps = mergeOnChainTokenSnapshot(pageProps, onChainToken);
+    }
+
+    let lockersBootstrap = null;
     if (tokenAddress) {
       const lockersUrl = `https://api.pinksale.finance/api/v1/lockers?chain_id=${chainId}&token=${tokenAddress}&limit=100&page=1&sortType=desc`;
       const lockersProxyUrl = `https://r.jina.ai/http://api.pinksale.finance/api/v1/lockers?chain_id=${chainId}&token=${tokenAddress}&limit=100&page=1&sortType=desc`;
-      lockers =
-        (await fetchJsonTry(lockersUrl, { Accept: "application/json" })) ||
-        (await fetchJsonTry(lockersProxyUrl, { Accept: "text/plain" }));
+      lockersBootstrap = await fetchPinksaleLockersBootstrap({
+        cacheKey: makeBootstrapCacheKey(chainId, tokenAddress),
+        lockersUrl,
+        lockersProxyUrl
+      });
     }
 
-    const lockerDocs = Array.isArray(lockers?.docs) ? lockers.docs : [];
+    const lockerDocs = Array.isArray(lockersBootstrap?.value?.docs)
+      ? lockersBootstrap.value.docs
+      : [];
     const lockableDocs = lockerDocs
       .map((doc) => {
         const lockId = String(doc?.lock_id || "");
@@ -755,10 +1177,12 @@ export default async function handler(req, res) {
     const lockRecords = await Promise.all(
       lockableDocs.map(async ({ doc, lockId, apiAmount, apiUnlocked, apiCurrentLockedAmount }) => {
         const resolvedChainId = Number(doc?.chain_id || chainId);
-        let title =
-          doc?.solana_details?.locker_title ||
-          (doc?.is_liquidity ? "Liquidity Lock" : `Lock ${lockId}`);
-        let cycleValue = doc?.solana_details?.locker_title ? parseCycleDays(title) : 0;
+        const tokenDecimals =
+          toPositiveSafeNumber(doc?.token_decimals) ||
+          toPositiveSafeNumber(pageProps?.pool?.token?.decimals) ||
+          18;
+        let title = resolveLockerDocTitle(doc, lockId);
+        let cycleValue = parseCycleDays(title);
         let cycleUnit = "days";
         let cycleSeconds = 0;
         let lockDate = toPositiveSafeNumber(doc?.lock_date);
@@ -805,6 +1229,44 @@ export default async function handler(req, res) {
           }
         }
 
+        if (
+          isSupportedEvmChain(resolvedChainId) &&
+          (isGenericLockTitle(title, lockId, Boolean(doc?.is_liquidity)) ||
+            (!cycleValue && !tgePercentBps && !cycleReleasePercentBps))
+        ) {
+          const pageRecord = await fetchPinklockRecordFromPage({
+            chainId: resolvedChainId,
+            lockId,
+            tokenDecimals
+          });
+          if (pageRecord) {
+            title = pageRecord.title || title;
+            if (pageRecord.amount) {
+              amount = toBigIntSafe(pageRecord.amount) || amount;
+            }
+            if (pageRecord.unlockedAmount) {
+              unlocked = toBigIntSafe(pageRecord.unlockedAmount);
+            }
+            currentLockedAmount = amount > unlocked ? amount - unlocked : 0n;
+            cycleSeconds = pageRecord.cycleSeconds || cycleSeconds;
+            cycleUnit = pageRecord.cycleUnit || cycleUnit;
+            cycleValue = pageRecord.cycleValue || cycleValue;
+            lockDate = pageRecord.lockDate || lockDate;
+            expiredAt = pageRecord.tgeDate || expiredAt;
+            tgePercentBps = pageRecord.tgePercentBps || tgePercentBps;
+            cycleReleasePercentBps =
+              pageRecord.cycleReleasePercentBps || cycleReleasePercentBps;
+          }
+        }
+
+        if (isGenericLockTitle(title, lockId, Boolean(doc?.is_liquidity))) {
+          title = getFallbackLockTitle({
+            lockId,
+            isLiquidity: Boolean(doc?.is_liquidity),
+            title
+          });
+        }
+
         const cycleText = formatPinklockCycleText(cycleValue, cycleUnit);
 
         return {
@@ -835,8 +1297,15 @@ export default async function handler(req, res) {
     res.status(200).json({
       source: {
         url: target,
-        fetchedAt: new Date().toISOString(),
-        mode: sourceMode
+        fetchedAt: new Date(poolBootstrap.fetchedAtMs || Date.now()).toISOString(),
+        servedAt: new Date().toISOString(),
+        mode: poolBootstrap.sourceMode,
+        cacheStatus: poolBootstrap.cacheStatus,
+        cacheAgeMs: poolBootstrap.cacheAgeMs,
+        lockersMode: lockersBootstrap?.sourceMode || null,
+        lockersCacheStatus: lockersBootstrap?.cacheStatus || null,
+        lockersCacheAgeMs: lockersBootstrap?.cacheAgeMs ?? null,
+        onChainTokenSource: onChainToken?.source || null
       },
       chain,
       poolAddress,

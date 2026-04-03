@@ -1,6 +1,7 @@
 import { useRouter } from "next/router";
 import { useEffect, useMemo, useState } from "react";
 import {
+  getChainName,
   getChainSlug,
   getPinksaleLaunchpadUrl,
   isEvmChain
@@ -548,7 +549,7 @@ export default function PoolDetailsPage() {
 
         <h1 style={styles.h1}>Token Details</h1>
         <p style={styles.sub}>
-          Chain: {chainId || "-"} | Pool: {poolAddress || "-"}
+          Chain: {chainId ? `${getChainName(chainId)} (${chainId})` : "-"} | Pool: {poolAddress || "-"}
         </p>
 
         {(loadingDoc || loadingTok) && <p>Loading details...</p>}
