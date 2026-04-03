@@ -42,10 +42,7 @@ const EVM_RPC_BY_CHAIN_ID = {
 };
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
-
-const SOLANA_RPC =
-  process.env.NEXT_PUBLIC_SOLANA_RPC ||
-  "https://api.mainnet-beta.solana.com";
+const NON_EVM_RPC_PROXY = "/api/non-evm-rpc";
 const SOLANA_WRAPPED_SOL_MINT =
   "So11111111111111111111111111111111111111112";
 
@@ -183,6 +180,22 @@ function getConicGradient(stops) {
     chunks.push(`transparent ${acc}% 100%`);
   }
   return `conic-gradient(${chunks.join(", ")})`;
+}
+
+async function callNonEvmRpc(chain, body) {
+  const res = await fetch(NON_EVM_RPC_PROXY, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chain,
+      ...body
+    })
+  });
+  const json = await res.json();
+  if (!res.ok) {
+    throw new Error(json?.error || `Non-EVM RPC request failed (${res.status})`);
+  }
+  return json;
 }
 
 function tsToTimeString(tsMs) {
@@ -346,12 +359,7 @@ export default function MarketFlowV2Page() {
               ]
             };
 
-            const res = await fetch(SOLANA_RPC, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(body)
-            });
-            const json = await res.json();
+            const json = await callNonEvmRpc("solana", body);
             const value = json && json.result && json.result.value;
             if (Array.isArray(value)) {
               // Group by mint and sum raw amounts.
@@ -412,12 +420,7 @@ export default function MarketFlowV2Page() {
               method: "getTokenAccountBalance",
               params: [poolAddress, { commitment: "confirmed" }]
             };
-            const res = await fetch(SOLANA_RPC, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(body)
-            });
-            const json = await res.json();
+            const json = await callNonEvmRpc("solana", body);
             const val = json && json.result && json.result.value;
             if (val && typeof val.amount === "string") {
               const amtStr = val.amount;
@@ -443,12 +446,7 @@ export default function MarketFlowV2Page() {
               method: "getBalance",
               params: [poolAddress, { commitment: "confirmed" }]
             };
-            const res = await fetch(SOLANA_RPC, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(body)
-            });
-            const json = await res.json();
+            const json = await callNonEvmRpc("solana", body);
             const lamports =
               json &&
               json.result &&

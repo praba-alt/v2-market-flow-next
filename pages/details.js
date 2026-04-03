@@ -168,12 +168,12 @@ function isVestingRecord(record) {
   );
 }
 
-function formatUnlockDate(unixSeconds) {
+function getUnlockDateParts(unixSeconds) {
   const value = Number(unixSeconds || 0);
-  if (!Number.isFinite(value) || value <= 0) return "-";
+  if (!Number.isFinite(value) || value <= 0) return null;
 
   const date = new Date(value * 1000);
-  if (Number.isNaN(date.getTime())) return "-";
+  if (Number.isNaN(date.getTime())) return null;
 
   const year = date.getUTCFullYear();
   const month = String(date.getUTCMonth() + 1).padStart(2, "0");
@@ -181,7 +181,47 @@ function formatUnlockDate(unixSeconds) {
   const hours = String(date.getUTCHours()).padStart(2, "0");
   const minutes = String(date.getUTCMinutes()).padStart(2, "0");
 
-  return `${year}.${month}.${day} ${hours}:${minutes} UTC`;
+  return {
+    dateText: `${year}.${month}.${day}`,
+    timeText: `${hours}:${minutes} UTC`
+  };
+}
+
+function formatUnlockCountdown(unixSeconds, nowMs) {
+  const value = Number(unixSeconds || 0);
+  if (!Number.isFinite(value) || value <= 0 || !Number.isFinite(nowMs) || nowMs <= 0) return "";
+
+  const diffMs = value * 1000 - nowMs;
+  const absMs = Math.abs(diffMs);
+
+  if (absMs < 60000) {
+    return diffMs >= 0 ? "in <1m" : "<1m ago";
+  }
+
+  const totalMinutes = Math.floor(absMs / 60000);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const text = `${days}d ${hours}h ${minutes}m`;
+
+  return diffMs >= 0 ? `in ${text}` : `${text} ago`;
+}
+
+function formatDurationCompact(totalSeconds) {
+  const value = Number(totalSeconds || 0);
+  if (!Number.isFinite(value) || value <= 0) return "-";
+
+  const totalMinutes = Math.floor(value / 60);
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0 && parts.length < 2) parts.push(`${minutes}m`);
+
+  return parts.length ? parts.slice(0, 2).join(" ") : "<1m";
 }
 
 function isRecordCurrentlyLocked(record) {
@@ -195,14 +235,6 @@ function getAllocationStatus(record) {
   if (locked > 0n) return "locked";
   if (unlocked > 0n) return "unlocked";
   return null;
-}
-
-function getAllocationStatusLabel(record) {
-  const status = getAllocationStatus(record);
-  if (status === "partial") return "Partially Unlocked";
-  if (status === "locked") return "Locked Allocation";
-  if (status === "unlocked") return "Unlocked Allocation";
-  return "Allocation";
 }
 
 function getStatusMarkerLabel(status) {
@@ -299,6 +331,32 @@ function LockOpenIcon({ style }) {
   );
 }
 
+function HeaderLabel({ label, meta }) {
+  return (
+    <span style={styles.thContent}>
+      <span>{label}</span>
+      {meta ? <span style={styles.thMeta}>{meta}</span> : null}
+    </span>
+  );
+}
+
+function UnlockTimeCell({ expiredAt, nowMs }) {
+  const dateParts = getUnlockDateParts(expiredAt);
+  const countdown = formatUnlockCountdown(expiredAt, nowMs);
+
+  if (!dateParts) {
+    return <div style={styles.timeCell}>-</div>;
+  }
+
+  return (
+    <div style={styles.timeCell}>
+      <div>{dateParts.dateText}</div>
+      <div style={styles.timeSub}>{dateParts.timeText}</div>
+      {countdown ? <div style={styles.timeMeta}>{countdown}</div> : null}
+    </div>
+  );
+}
+
 export default function PoolDetailsPage() {
   const router = useRouter();
   const chainId = router.query.chainId ? Number(router.query.chainId) : null;
@@ -312,6 +370,15 @@ export default function PoolDetailsPage() {
   const [tokenomics, setTokenomics] = useState(null);
   const [loadingTok, setLoadingTok] = useState(false);
   const [tokError, setTokError] = useState("");
+  const [nowMs, setNowMs] = useState(null);
+
+  useEffect(() => {
+    setNowMs(Date.now());
+    const id = setInterval(() => {
+      setNowMs(Date.now());
+    }, 30000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     if (!chainId || !poolAddress) return;
@@ -381,17 +448,26 @@ export default function PoolDetailsPage() {
     () => (Array.isArray(tokenomics?.lockRecords) ? tokenomics.lockRecords : []),
     [tokenomics]
   );
+  const liquidityLockRecords = useMemo(
+    () =>
+      Array.isArray(tokenomics?.mappedTokenomics?.liquidityLockRecords)
+        ? tokenomics.mappedTokenomics.liquidityLockRecords
+        : [],
+    [tokenomics]
+  );
   const lpIsBurned =
     Boolean(tokenomics?.rawRiskDetails?.isLpBurned) || Boolean(poolDoc?.riskDetails?.isLpBurned);
   const liquidityLockDuration = Number(pool?.liquidityLockDuration || 0);
   const liquidityStatus = useMemo(() => {
     if (lpIsBurned) return null;
+    const statusFromLiquidityLocks = combineAllocationStatuses(liquidityLockRecords);
+    if (statusFromLiquidityLocks) return statusFromLiquidityLocks;
     const statusFromRecords = combineAllocationStatuses(
       lockRecords.filter((record) => Boolean(record?.isLiquidity))
     );
     if (statusFromRecords) return statusFromRecords;
     return liquidityLockDuration > 0 ? "locked" : null;
-  }, [lockRecords, lpIsBurned, liquidityLockDuration]);
+  }, [liquidityLockRecords, lockRecords, lpIsBurned, liquidityLockDuration]);
 
   const slices = useMemo(() => {
     const detailed = Array.isArray(tokenomics?.mappedTokenomics?.chartSegments)
@@ -458,10 +534,17 @@ export default function PoolDetailsPage() {
     [lockRecords]
   );
 
-  const hasActiveLockRecords = useMemo(
-    () => lockRecords.some((record) => isRecordCurrentlyLocked(record)),
-    [lockRecords]
+  const allLockRecords = useMemo(
+    () => [...liquidityLockRecords, ...lockRecords],
+    [liquidityLockRecords, lockRecords]
   );
+
+  const hasActiveLockRecords = useMemo(
+    () => allLockRecords.some((record) => isRecordCurrentlyLocked(record)),
+    [allLockRecords]
+  );
+
+  const allLockRecordCount = allLockRecords.length;
 
   return (
     <main style={styles.page}>
@@ -550,16 +633,16 @@ export default function PoolDetailsPage() {
         <section style={styles.card}>
           <div style={styles.sectionHead}>
             <h2 style={styles.h2}>Lock Records</h2>
-            {lockRecords.length > 0 ? (
+            {allLockRecordCount > 0 ? (
               <span style={styles.countPill}>
-                {lockRecords.length} record{lockRecords.length === 1 ? "" : "s"}
+                {allLockRecordCount} record{allLockRecordCount === 1 ? "" : "s"}
               </span>
             ) : null}
           </div>
 
           {loadingTok && !tokenomics ? (
             <p style={styles.sub}>Loading lock records...</p>
-          ) : lockRecords.length > 0 ? (
+          ) : allLockRecordCount > 0 ? (
             <>
               {!hasActiveLockRecords ? (
                 <p style={styles.sub}>
@@ -570,20 +653,80 @@ export default function PoolDetailsPage() {
 
               <div style={styles.tableWrap}>
                 <div style={styles.tableStack}>
-                  {vestingLockRecords.length > 0 ? (
+                  {liquidityLockRecords.length > 0 ? (
                     <div style={styles.tableGroup}>
-                      <div style={styles.groupLabel}>Vesting Allocations</div>
-                      <table style={styles.table}>
+                      <div style={styles.groupLabel}>Liquidity Lock Records</div>
+                      <table style={styles.tableCompact}>
                         <thead>
                           <tr>
                             <th style={{ ...styles.th, ...styles.statusTh }}>Lock</th>
                             <th style={styles.th}>Title</th>
-                            <th style={styles.th}>Amount ({tokenSymbol})</th>
-                            <th style={styles.th}>Unlocked Amount ({tokenSymbol})</th>
+                            <th style={styles.th}>
+                              <HeaderLabel label="Amount" meta={tokenSymbol} />
+                            </th>
+                            <th style={styles.th}>
+                              <HeaderLabel label="Unlocked" meta={tokenSymbol} />
+                            </th>
+                            <th style={styles.th}>Period</th>
+                            <th style={styles.th}>
+                              <HeaderLabel label="Unlock" meta="UTC" />
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {liquidityLockRecords.map((record) => (
+                            <tr key={record.lockId}>
+                              <td style={{ ...styles.td, ...styles.statusTd }}>
+                                <StatusMarker status={getAllocationStatus(record)} />
+                              </td>
+                              <td style={styles.td}>
+                                <div style={styles.cellTitle}>{record.title || "Auto Listing Liquidity"}</div>
+                                <div style={styles.cellMeta}>
+                                  Auto liquidity lock
+                                  {record?.isEstimatedUnlockTime
+                                    ? " | Est. until finalize"
+                                    : ""}
+                                </div>
+                              </td>
+                              <td style={{ ...styles.td, ...styles.monoCell }}>
+                                {formatTokenAmount(record.amount, tokenDecimals)}
+                              </td>
+                              <td style={{ ...styles.td, ...styles.monoCell }}>
+                                {formatTokenAmount(record.unlockedAmount, tokenDecimals)}
+                              </td>
+                              <td style={{ ...styles.td, ...styles.monoCell }}>
+                                {formatDurationCompact(record.lockDurationSeconds)}
+                              </td>
+                              <td style={{ ...styles.td, ...styles.monoCell }}>
+                                <UnlockTimeCell expiredAt={record.expiredAt} nowMs={nowMs} />
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : null}
+
+                  {vestingLockRecords.length > 0 ? (
+                    <div style={styles.tableGroup}>
+                      <div style={styles.groupLabel}>Vesting Lock Records</div>
+                      <table style={styles.tableCompact}>
+                        <thead>
+                          <tr>
+                            <th style={{ ...styles.th, ...styles.statusTh }}>Lock</th>
+                            <th style={styles.th}>Title</th>
+                            <th style={styles.th}>
+                              <HeaderLabel label="Amount" meta={tokenSymbol} />
+                            </th>
+                            <th style={styles.th}>
+                              <HeaderLabel label="Unlocked" meta={tokenSymbol} />
+                            </th>
                             <th style={styles.th}>Cycle(d)</th>
-                            <th style={styles.th}>Cycle Release(%)</th>
+                            <th style={styles.th}>Release(%)</th>
                             <th style={styles.th}>TGE(%)</th>
-                            <th style={styles.th}>Unlock time(UTC)</th>
+                            <th style={styles.th}>
+                              <HeaderLabel label="Unlock" meta="UTC" />
+                            </th>
                           </tr>
                         </thead>
                         <tbody>
@@ -594,9 +737,7 @@ export default function PoolDetailsPage() {
                               </td>
                               <td style={styles.td}>
                                 <div style={styles.cellTitle}>{record.title || `Lock ${record.lockId}`}</div>
-                                <div style={styles.cellMeta}>
-                                  Lock ID: {record.lockId} | {getAllocationStatusLabel(record)}
-                                </div>
+                                <div style={styles.cellMeta}>Lock #{record.lockId}</div>
                               </td>
                               <td style={{ ...styles.td, ...styles.monoCell }}>
                                 {formatTokenAmount(record.amount, tokenDecimals)}
@@ -614,7 +755,7 @@ export default function PoolDetailsPage() {
                                 {formatPercentValue(record.tgePercent)}
                               </td>
                               <td style={{ ...styles.td, ...styles.monoCell }}>
-                                {formatUnlockDate(record.expiredAt)}
+                                <UnlockTimeCell expiredAt={record.expiredAt} nowMs={nowMs} />
                               </td>
                             </tr>
                           ))}
@@ -625,15 +766,21 @@ export default function PoolDetailsPage() {
 
                   {scheduledLockRecords.length > 0 ? (
                     <div style={styles.tableGroup}>
-                      <div style={styles.groupLabel}>One-Time Unlock Allocations</div>
-                      <table style={styles.table}>
+                      <div style={styles.groupLabel}>Cliff Lock Records</div>
+                      <table style={styles.tableCompact}>
                         <thead>
                           <tr>
                             <th style={{ ...styles.th, ...styles.statusTh }}>Lock</th>
                             <th style={styles.th}>Title</th>
-                            <th style={styles.th}>Amount ({tokenSymbol})</th>
-                            <th style={styles.th}>Unlocked Amount ({tokenSymbol})</th>
-                            <th style={styles.th}>Unlock date(UTC)</th>
+                            <th style={styles.th}>
+                              <HeaderLabel label="Amount" meta={tokenSymbol} />
+                            </th>
+                            <th style={styles.th}>
+                              <HeaderLabel label="Unlocked" meta={tokenSymbol} />
+                            </th>
+                            <th style={styles.th}>
+                              <HeaderLabel label="Unlock" meta="UTC" />
+                            </th>
                           </tr>
                         </thead>
                         <tbody>
@@ -644,9 +791,7 @@ export default function PoolDetailsPage() {
                               </td>
                               <td style={styles.td}>
                                 <div style={styles.cellTitle}>{record.title || `Lock ${record.lockId}`}</div>
-                                <div style={styles.cellMeta}>
-                                  Lock ID: {record.lockId} | {getAllocationStatusLabel(record)}
-                                </div>
+                                <div style={styles.cellMeta}>Lock #{record.lockId}</div>
                               </td>
                               <td style={{ ...styles.td, ...styles.monoCell }}>
                                 {formatTokenAmount(record.amount, tokenDecimals)}
@@ -655,7 +800,7 @@ export default function PoolDetailsPage() {
                                 {formatTokenAmount(record.unlockedAmount, tokenDecimals)}
                               </td>
                               <td style={{ ...styles.td, ...styles.monoCell }}>
-                                {formatUnlockDate(record.expiredAt)}
+                                <UnlockTimeCell expiredAt={record.expiredAt} nowMs={nowMs} />
                               </td>
                             </tr>
                           ))}
@@ -803,14 +948,14 @@ const styles = {
   },
   tableStack: {
     display: "grid",
-    gap: 16
+    gap: 12
   },
   tableGroup: {
     display: "grid",
-    gap: 8
+    gap: 6
   },
   groupLabel: {
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: 700,
     letterSpacing: 0.3,
     color: "#cbd5e1",
@@ -821,10 +966,15 @@ const styles = {
     minWidth: 1220,
     borderCollapse: "collapse"
   },
+  tableCompact: {
+    width: "100%",
+    minWidth: 720,
+    borderCollapse: "collapse"
+  },
   th: {
-    padding: "12px 14px",
+    padding: "7px 8px",
     textAlign: "left",
-    fontSize: 12,
+    fontSize: 11,
     color: "#93c5fd",
     background: "#0b1220",
     textTransform: "uppercase",
@@ -833,33 +983,56 @@ const styles = {
     whiteSpace: "nowrap"
   },
   statusTh: {
-    width: 56,
-    minWidth: 56,
+    width: 34,
+    minWidth: 34,
     textAlign: "center"
   },
   td: {
-    padding: "14px",
+    padding: "8px",
     borderTop: "1px solid #1f2937",
     color: "#e5e7eb",
     verticalAlign: "top"
   },
   statusTd: {
-    width: 56,
-    minWidth: 56,
+    width: 34,
+    minWidth: 34,
     textAlign: "center",
     verticalAlign: "middle"
   },
   cellTitle: {
-    fontSize: 15,
+    fontSize: 13,
     fontWeight: 600
   },
   cellMeta: {
-    marginTop: 4,
-    fontSize: 12,
+    marginTop: 2,
+    fontSize: 10,
+    color: "#9ca3af"
+  },
+  thContent: {
+    display: "grid",
+    gap: 1,
+    lineHeight: 1.1
+  },
+  thMeta: {
+    fontSize: 10,
+    color: "#60a5fa",
+    fontWeight: 500
+  },
+  timeCell: {
+    display: "grid",
+    gap: 1
+  },
+  timeSub: {
+    fontSize: 10,
+    color: "#cbd5e1"
+  },
+  timeMeta: {
+    fontSize: 10,
     color: "#9ca3af"
   },
   monoCell: {
     whiteSpace: "nowrap",
-    fontVariantNumeric: "tabular-nums"
+    fontVariantNumeric: "tabular-nums",
+    fontSize: 13
   }
 };

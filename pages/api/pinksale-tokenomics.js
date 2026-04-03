@@ -1,3 +1,5 @@
+import { callNonEvmRpc } from "../../lib/non-evm-rpc";
+
 function parseNextData(html) {
   const marker = '<script id="__NEXT_DATA__" type="application/json">';
   const start = html.indexOf(marker);
@@ -104,7 +106,6 @@ const EVM_PINKLOCK_BY_CHAIN_ID = {
 };
 
 const GET_LOCK_BY_ID_SELECTOR = "0x08f12470";
-const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || "https://node-solana.pinksale.com/";
 const SOLANA_LOCK_LAYOUT = {
   lockDateOffset: 144,
   unlockDateOffset: 152,
@@ -247,28 +248,6 @@ async function callEthereumRpc(rpcUrl, method, params, timeoutMs = 15000) {
   return res.json();
 }
 
-async function callSolanaRpc(method, params, timeoutMs = 15000) {
-  const signal =
-    typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
-      ? AbortSignal.timeout(timeoutMs)
-      : undefined;
-
-  const res = await fetch(SOLANA_RPC_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    cache: "no-store",
-    signal,
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method,
-      params
-    })
-  });
-
-  return res.json();
-}
-
 async function fetchPinklockRecordOnChain({ chainId, lockId, lockVersion }) {
   const rpcUrl = EVM_RPC_BY_CHAIN_ID[Number(chainId)];
   const pinklockAddress = choosePinklockAddress(chainId, lockVersion, lockId);
@@ -334,7 +313,8 @@ async function fetchSolanaPinklockRecord(lockerPubkey) {
   if (!lockerPubkey) return null;
 
   try {
-    const payload = await callSolanaRpc(
+    const payload = await callNonEvmRpc(
+      "solana",
       "getAccountInfo",
       [lockerPubkey, { encoding: "base64" }],
       10000
@@ -415,6 +395,54 @@ function fitEntriesToAmount(entries, targetAmount) {
     remaining -= nextAmount;
     return { ...entry, amount: nextAmount };
   });
+}
+
+function getLiquidityLockBaseTime(sale) {
+  const finishTime = toPositiveSafeNumber(sale?.finishTime);
+  if (finishTime > 0) {
+    return { baseTime: finishTime, isEstimated: false };
+  }
+
+  const endTime = toPositiveSafeNumber(sale?.endTime);
+  if (endTime > 0) {
+    return { baseTime: endTime, isEstimated: true };
+  }
+
+  const claimTime = toPositiveSafeNumber(sale?.claimTime);
+  if (claimTime > 0) {
+    return { baseTime: claimTime, isEstimated: true };
+  }
+
+  return { baseTime: 0, isEstimated: true };
+}
+
+function buildLiquidityLockRecords({ sale, risk, tokensForLiquidity }) {
+  const amount = toBigIntSafe(tokensForLiquidity);
+  const lockDurationSeconds = toPositiveSafeNumber(sale?.liquidityLockDuration);
+  if (amount <= 0n || !lockDurationSeconds || Boolean(risk?.isLpBurned)) {
+    return [];
+  }
+
+  const { baseTime, isEstimated } = getLiquidityLockBaseTime(sale);
+  const expiredAt = baseTime > 0 ? baseTime + lockDurationSeconds : 0;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const isCurrentlyLocked = expiredAt <= 0 || expiredAt > nowSec;
+
+  return [
+    {
+      lockId: "liquidity-auto",
+      title: "Auto Listing Liquidity",
+      amount: amount.toString(),
+      unlockedAmount: isCurrentlyLocked ? "0" : amount.toString(),
+      currentLockedAmount: isCurrentlyLocked ? amount.toString() : "0",
+      lockDate: baseTime,
+      expiredAt,
+      lockDurationSeconds,
+      isEstimatedUnlockTime: isEstimated,
+      isLiquidity: true,
+      isAutoLiquidityLock: true
+    }
+  ];
 }
 
 function mapTokenomicsWithLockRecords(pageProps, lockRecords) {
@@ -564,6 +592,12 @@ function mapTokenomicsWithLockRecords(pageProps, lockRecords) {
     });
   }
 
+  const liquidityLockRecords = buildLiquidityLockRecords({
+    sale,
+    risk,
+    tokensForLiquidity
+  });
+
   return {
     totalSupply: totalSupply.toString(),
     tokensForPresale: tokensForPresale.toString(),
@@ -579,6 +613,7 @@ function mapTokenomicsWithLockRecords(pageProps, lockRecords) {
     lockedPercent,
     antirugPercent,
     chartSegments,
+    liquidityLockRecords,
     vestingRecords: vestingRecords.map((r) => ({
       lockId: r.lockId,
       title: r.title,
