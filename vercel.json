@@ -1,0 +1,12 @@
+{
+  "crons": [
+    {
+      "path": "/api/v2/contract-pools/cron",
+      "schedule": "*/30 * * * *"
+    },
+    {
+      "path": "/api/v2/contract-pools/cron-enrich",
+      "schedule": "15,45 * * * *"
+    }
+  ]
+}

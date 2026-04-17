@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import Script from "next/script";
+import Link from "next/link";
 import {
   getChainName,
-  getDefaultEvmRpcUrl,
   getPinksaleLaunchpadUrl
 } from "../lib/pinksale-chains";
+import { isTemporarilyUnavailableChain } from "../lib/chain-availability";
 
 const PAGE_SIZE = 20;
 
@@ -29,10 +29,6 @@ const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const NON_EVM_RPC_PROXY = "/api/non-evm-rpc";
 const SOLANA_WRAPPED_SOL_MINT =
   "So11111111111111111111111111111111111111112";
-
-const PRESALE_POOL_ABI = [
-  "function poolStates() view returns (uint8 state, uint256 finishTime, uint256 totalRaised, uint256 totalCommitted, uint256 totalVolumePurchased, uint256 liquidityUnlockTime, int256 lockId, string poolDetails, string kycDetails)"
-];
 
 function makePoolKey(chainId, addr) {
   if (!chainId || !addr || typeof addr !== "string") return null;
@@ -242,7 +238,9 @@ export default function MarketFlowV2Page() {
         }
 
         if (!cancelled) {
-          const docs = Array.isArray(json.docs) ? json.docs : [];
+          const docs = Array.isArray(json.docs)
+            ? json.docs.filter((doc) => !isTemporarilyUnavailableChain(doc?.chainId))
+            : [];
           setAllDocs(docs);
         }
       } catch (e) {
@@ -512,30 +510,21 @@ export default function MarketFlowV2Page() {
         }
       }
 
-      // EVM chains: use ethers + poolStates().
-      if (typeof window === "undefined" || !window.ethers) return null;
-      const { ethers } = window;
-
-      const rpcUrl = getDefaultEvmRpcUrl(chainId);
-      if (!rpcUrl || !poolAddress) return null;
-
+      // EVM chains: call server-side API (no client-side RPC or secrets).
+      if (!poolAddress) return null;
       try {
-        const provider = new ethers.JsonRpcProvider(rpcUrl);
-        const contract = new ethers.Contract(
-          poolAddress,
-          PRESALE_POOL_ABI,
-          provider
-        );
-
-        const states = await contract.poolStates();
-        const stateValue =
-          (states && (states.state ?? states[0])) != null
-            ? states.state ?? states[0]
-            : null;
-        const totalRaisedRaw =
-          (states && (states.totalRaised ?? states[2])) != null
-            ? states.totalRaised ?? states[2]
-            : null;
+        const qs = new URLSearchParams({
+          chainId: String(chainId),
+          poolAddress: String(poolAddress)
+        });
+        const res = await fetch(`/api/pool-live-state?${qs.toString()}`, {
+          method: "GET",
+          cache: "no-store"
+        });
+        const json = await res.json();
+        if (!res.ok || !json?.ok) return null;
+        const stateValue = json?.state;
+        const totalRaisedRaw = json?.totalRaised;
 
         if (totalRaisedRaw == null) return null;
 
@@ -660,13 +649,17 @@ export default function MarketFlowV2Page() {
         padding: "1rem"
       }}
     >
-      <Script
-        src="https://cdn.jsdelivr.net/npm/ethers@6.7.0/dist/ethers.umd.min.js"
-        strategy="afterInteractive"
-      />
       <h1 style={{ fontSize: "1.1rem", marginBottom: "0.75rem" }}>
         Pinksale Market Flow – V2 Cards
       </h1>
+      <div style={{ marginBottom: "0.75rem" }}>
+        <Link
+          href="/contract-pools"
+          style={{ color: "#93c5fd", textDecoration: "none", fontSize: "0.9rem" }}
+        >
+          Open Contract-Based Pools (SQLite + ABI Enrichment)
+        </Link>
+      </div>
 
       <div
         style={{

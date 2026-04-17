@@ -4,6 +4,10 @@ node_modules/
 # Next.js build output
 .next/
 out/
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
 # Production builds
 build/
